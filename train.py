@@ -789,19 +789,53 @@ def run_one(
         x_train, y_train, tomek_note = apply_tomek_if_needed(x_train, y_train, variant)
 
     best_params: dict[str, Any] = {}
+    selected_threshold: float | None = None
+    threshold_info: dict[str, float] = {}
+    val_metric_values: dict[str, float] = {}
     if model in {"logreg", "svm", "rf", "xgboost", "catboost", "lightgbm"}:
         best_params = tune_params(model, x_train, y_train, x_val, y_val, args.tune_trials)
         estimator = build_estimator(model, best_params)
-        fit_x = pd.concat([x_train, x_val], ignore_index=True) if not x_val.empty else x_train
-        fit_y = pd.concat([y_train, y_val], ignore_index=True) if not y_val.empty else y_train
-        if model in {"xgboost", "catboost", "lightgbm"}:
-            fit_transferred_estimator(model, estimator, fit_x, fit_y, x_val if not x_val.empty else None, y_val if not x_val.empty else None)
-            y_pred = predict_transferred_binary(model, estimator, x_test)
-            y_score = predict_transferred_scores(model, estimator, x_test)
+        if model == "logreg" and not x_val.empty:
+            estimator.fit(x_train, y_train)
+            val_score = predict_scores(estimator, x_val)
+            if val_score is None:
+                val_pred = estimator.predict(x_val).astype(int)
+                y_pred = estimator.predict(x_test).astype(int)
+                y_score = predict_scores(estimator, x_test)
+                selected_threshold = 0.5
+                threshold_info = {
+                    "threshold": selected_threshold,
+                    "recall": float(recall_score(y_val, val_pred, zero_division=0)),
+                    "precision": float(precision_score(y_val, val_pred, zero_division=0)),
+                    "f1": float(f1_score(y_val, val_pred, zero_division=0)),
+                    "objective": 0.0,
+                }
+                val_metric_values = {
+                    "val_precision": threshold_info["precision"],
+                    "val_recall": threshold_info["recall"],
+                    "val_f1": threshold_info["f1"],
+                    "val_accuracy": float(accuracy_score(y_val, val_pred)),
+                }
+            else:
+                threshold_info = search_threshold(y_val.to_numpy(dtype=int), val_score)
+                selected_threshold = threshold_info["threshold"]
+                y_score = predict_scores(estimator, x_test)
+                if y_score is None:
+                    y_pred = estimator.predict(x_test).astype(int)
+                else:
+                    y_pred = (np.asarray(y_score, dtype=float) >= selected_threshold).astype(int)
+                val_metric_values = validation_metrics(y_val, val_score, selected_threshold)
         else:
-            estimator.fit(fit_x, fit_y)
-            y_pred = estimator.predict(x_test).astype(int)
-            y_score = predict_scores(estimator, x_test)
+            fit_x = pd.concat([x_train, x_val], ignore_index=True) if not x_val.empty else x_train
+            fit_y = pd.concat([y_train, y_val], ignore_index=True) if not y_val.empty else y_train
+            if model in {"xgboost", "catboost", "lightgbm"}:
+                fit_transferred_estimator(model, estimator, fit_x, fit_y, x_val if not x_val.empty else None, y_val if not x_val.empty else None)
+                y_pred = predict_transferred_binary(model, estimator, x_test)
+                y_score = predict_transferred_scores(model, estimator, x_test)
+            else:
+                estimator.fit(fit_x, fit_y)
+                y_pred = estimator.predict(x_test).astype(int)
+                y_score = predict_scores(estimator, x_test)
     elif model == "blitecast":
         aligned = test_df.sort_values(["year", "day"])
         precipitation = aligned.get("precipitation", pd.Series(0, index=aligned.index)).fillna(0)
@@ -841,11 +875,32 @@ def run_one(
         "precision": precision,
         "recall": recall,
         "accuracy": accuracy,
+        "threshold": selected_threshold,
+        "threshold_objective": threshold_info.get("objective"),
+        "val_precision": val_metric_values.get("val_precision"),
+        "val_recall": val_metric_values.get("val_recall"),
+        "val_f1": val_metric_values.get("val_f1"),
+        "val_accuracy": val_metric_values.get("val_accuracy"),
         "feature_count": len(feature_cols),
         "tomek_note": tomek_note or "",
         "best_params": json.dumps(best_params, ensure_ascii=False),
     }]
     write_csv(result_dir / "metrics.csv", metrics)
+    if selected_threshold is not None:
+        threshold_payload = {
+            "model": model,
+            "variant": variant,
+            "horizon": horizon,
+            "window_size": window_size,
+            "selected_threshold": selected_threshold,
+            "min_precision": MIN_PRECISION,
+            "validation": val_metric_values,
+            "selection": threshold_info,
+        }
+        (result_dir / "validation_threshold.json").write_text(
+            json.dumps(threshold_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     pred_rows = test_df[["year", "day"]].copy().reset_index(drop=True)
     pred_rows["y_true"] = np.asarray(y_test, dtype=int)
     pred_rows["y_pred_binary"] = np.asarray(y_pred, dtype=int)
@@ -876,6 +931,9 @@ def run_one(
             "feature_columns": feature_cols,
             "tomek_note": tomek_note or "",
             "best_params": best_params,
+            "threshold": selected_threshold,
+            "threshold_objective": threshold_info.get("objective"),
+            **val_metric_values,
         },
     )
     (result_dir / "train_val_test_years.json").write_text(
@@ -886,7 +944,20 @@ def run_one(
     zip_path = zip_result(result_dir, args.output_dir)
     maybe_upload(zip_path, args.output_dir, args.upload_dataset, args.dataset_slug)
     print(f"DONE {model} variant={variant} horizon={horizon} window={window_size} f1={f1:.3f} -> {result_dir} zip={zip_path}")
-    return ExperimentResult(model, variant, horizon, window_size, f1, result_dir, zip_path)
+    return ExperimentResult(
+        model,
+        variant,
+        horizon,
+        window_size,
+        f1,
+        result_dir,
+        zip_path,
+        threshold=selected_threshold,
+        val_precision=val_metric_values.get("val_precision"),
+        val_recall=val_metric_values.get("val_recall"),
+        val_f1=val_metric_values.get("val_f1"),
+        val_accuracy=val_metric_values.get("val_accuracy"),
+    )
 
 
 def enforce_top_n(results: list[ExperimentResult], top_n: int) -> list[ExperimentResult]:

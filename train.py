@@ -440,6 +440,13 @@ def tune_params(model: str, x_train: pd.DataFrame, y_train: pd.Series, x_val: pd
             pred = predict_transferred_binary(model, estimator, x_val)
         else:
             estimator.fit(x_train, y_train)
+            if model == "logreg":
+                val_scores = predict_scores(estimator, x_val)
+                if val_scores is None:
+                    pred = estimator.predict(x_val)
+                    return f1_score(y_val, pred, zero_division=0)
+                threshold_info = search_threshold(y_val.to_numpy(dtype=int), val_scores)
+                return threshold_objective_value(threshold_info["recall"], threshold_info["precision"])
             pred = estimator.predict(x_val)
         return f1_score(y_val, pred, zero_division=0)
 

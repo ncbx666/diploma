@@ -82,7 +82,7 @@ def run_experiments(
             }
             if model_name == "logreg":
                 config["threshold"] = fitted.threshold
-                config["threshold_tuning"] = "validation_f1"
+                config["threshold_tuning"] = "validation_precision_floor_then_recall"
                 config["validation_metrics"] = fitted.validation_metrics or {}
                 config["validation_threshold_objective"] = fitted.threshold_objective
             run_dir, zip_path = save_experiment_artifacts(output_dir, model_name, metrics, predictions, report, config, splits)

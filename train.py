@@ -58,6 +58,7 @@ except Exception:  # pragma: no cover - depends on runtime
     plt = None
 
 RANDOM_STATE = 42
+MIN_PRECISION = 0.60
 DEFAULT_DATA_FILE = "Golitcino72-17d2_CLEAN.xlsx"
 DEFAULT_OUTPUT_DIR = Path("/kaggle/working/outputs")
 SUPPORTED_MODELS = ("logreg", "svm", "rf", "gru", "tft", "blitecast", "xgboost", "catboost", "lightgbm", "arima", "sarima")
@@ -126,6 +127,11 @@ class ExperimentResult:
     f1: float
     output_dir: Path
     zip_path: Path
+    threshold: float | None = None
+    val_precision: float | None = None
+    val_recall: float | None = None
+    val_f1: float | None = None
+    val_accuracy: float | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -352,6 +358,67 @@ def build_estimator(model: str, params: dict[str, Any] | None = None) -> Any:
     if model in {"xgboost", "catboost", "lightgbm"}:
         return build_transferred_model(model, params)
     raise ValueError(f"Model {model} is not a tabular sklearn estimator.")
+
+
+def threshold_objective_value(recall_value: float, precision_value: float) -> float:
+    if precision_value >= MIN_PRECISION:
+        return 1.0 + recall_value + 0.001 * precision_value
+    return precision_value + 0.001 * recall_value
+
+
+def search_threshold(y_true: np.ndarray, scores: np.ndarray) -> dict[str, float]:
+    scores = np.asarray(scores, dtype=float).reshape(-1)
+    y_true = np.asarray(y_true).astype(int).reshape(-1)
+    if y_true.size == 0 or scores.size == 0:
+        raise ValueError("Cannot search threshold on an empty validation split.")
+    if y_true.size != scores.size:
+        usable = min(y_true.size, scores.size)
+        y_true = y_true[:usable]
+        scores = scores[:usable]
+    scores = np.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=0.0)
+    unique_scores = np.unique(np.round(scores, 10))
+    if unique_scores.size == 1:
+        unique_scores = np.array([unique_scores[0]])
+    if unique_scores.size > 400:
+        unique_scores = np.quantile(scores, np.linspace(0.0, 1.0, 400))
+    unique_scores = np.unique(np.concatenate([unique_scores, [0.5]]))
+
+    candidates: list[dict[str, float]] = []
+    for threshold in unique_scores:
+        y_pred = (scores >= threshold).astype(int)
+        recall_value = recall_score(y_true, y_pred, zero_division=0)
+        precision_value = precision_score(y_true, y_pred, zero_division=0)
+        f1_value = f1_score(y_true, y_pred, zero_division=0)
+        candidates.append({
+            "threshold": float(threshold),
+            "recall": float(recall_value),
+            "precision": float(precision_value),
+            "f1": float(f1_value),
+            "objective": float(threshold_objective_value(recall_value, precision_value)),
+        })
+
+    candidates_df = pd.DataFrame(candidates)
+    eligible = candidates_df[candidates_df["precision"] >= MIN_PRECISION]
+    if not eligible.empty:
+        best_row = eligible.sort_values(["recall", "precision", "f1", "threshold"], ascending=[False, False, False, True]).iloc[0]
+    else:
+        best_row = candidates_df.sort_values(["precision", "recall", "f1", "threshold"], ascending=[False, False, False, True]).iloc[0]
+    return {key: float(value) for key, value in best_row.to_dict().items()}
+
+
+def validation_metrics(y_true: pd.Series | np.ndarray, scores: np.ndarray, threshold: float) -> dict[str, float]:
+    y_true_arr = np.asarray(y_true).astype(int).reshape(-1)
+    scores_arr = np.asarray(scores, dtype=float).reshape(-1)
+    usable = min(y_true_arr.size, scores_arr.size)
+    y_true_arr = y_true_arr[:usable]
+    scores_arr = scores_arr[:usable]
+    y_pred = (scores_arr >= threshold).astype(int)
+    return {
+        "val_precision": float(precision_score(y_true_arr, y_pred, zero_division=0)),
+        "val_recall": float(recall_score(y_true_arr, y_pred, zero_division=0)),
+        "val_f1": float(f1_score(y_true_arr, y_pred, zero_division=0)),
+        "val_accuracy": float(accuracy_score(y_true_arr, y_pred)),
+    }
 
 
 def tune_params(model: str, x_train: pd.DataFrame, y_train: pd.Series, x_val: pd.DataFrame, y_val: pd.Series, trials: int) -> dict[str, Any]:

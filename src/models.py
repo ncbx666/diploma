@@ -424,7 +424,8 @@ def fit_predict_sklearn(
     if name == "logreg" and X_val is not None and y_val is not None and len(X_val) > 0:
         val_score = predict_scores(name, fitted, X_val)
         if val_score is not None:
-            threshold, threshold_objective = search_threshold(y_val, val_score)
+            threshold, threshold_info = search_threshold(y_val, val_score)
+            threshold_objective = threshold_info["objective"]
             val_pred = (val_score >= threshold).astype(int)
             validation_metrics, _ = evaluate_binary(y_val, val_pred)
     y_score = predict_scores(name, fitted, X_test)

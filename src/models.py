@@ -20,6 +20,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
+from .evaluation import evaluate_binary, search_threshold
+
 RANDOM_STATE = 42
 
 MODEL_ALIASES = {
@@ -395,6 +397,9 @@ class PredictionResult:
 
     y_pred_binary: np.ndarray
     y_score: Optional[np.ndarray] = None
+    threshold: float = 0.5
+    validation_metrics: Optional[dict[str, float]] = None
+    threshold_objective: Optional[float] = None
 
 
 def fit_predict_sklearn(
@@ -402,6 +407,8 @@ def fit_predict_sklearn(
     X_train: pd.DataFrame,
     y_train: Iterable[int],
     X_test: pd.DataFrame,
+    X_val: Optional[pd.DataFrame] = None,
+    y_val: Optional[Iterable[int]] = None,
     random_state: int = RANDOM_STATE,
 ) -> PredictionResult:
     """Backward-compatible helper for the simple training pipeline."""
@@ -411,8 +418,27 @@ def fit_predict_sklearn(
         params = {"n_estimators": 200, "class_weight": "balanced"}
     model = build_model(name, params, y_train)
     fitted = fit_estimator(name, model, X_train, y_train)
+    threshold = 0.5
+    validation_metrics: Optional[dict[str, float]] = None
+    threshold_objective: Optional[float] = None
+    if name == "logreg" and X_val is not None and y_val is not None and len(X_val) > 0:
+        val_score = predict_scores(name, fitted, X_val)
+        if val_score is not None:
+            threshold, threshold_objective = search_threshold(y_val, val_score)
+            val_pred = (val_score >= threshold).astype(int)
+            validation_metrics, _ = evaluate_binary(y_val, val_pred)
     y_score = predict_scores(name, fitted, X_test)
-    return PredictionResult(y_pred_binary=predict_binary(name, fitted, X_test), y_score=y_score)
+    if y_score is not None:
+        y_pred_binary = (y_score >= threshold).astype(int)
+    else:
+        y_pred_binary = predict_binary(name, fitted, X_test, threshold=threshold)
+    return PredictionResult(
+        y_pred_binary=y_pred_binary,
+        y_score=y_score,
+        threshold=threshold,
+        validation_metrics=validation_metrics,
+        threshold_objective=threshold_objective,
+    )
 
 
 def predict_blitecast(frame: pd.DataFrame) -> PredictionResult:

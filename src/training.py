@@ -42,12 +42,22 @@ def run_experiments(
         target_col = f"target_h{horizon}"
         feature_frame, features = add_engineered_features(data, window_sizes)
         train_df = feature_frame[feature_frame["year"].isin(splits["train"])]
+        val_df = feature_frame[feature_frame["year"].isin(splits["val"])]
         test_df = feature_frame[feature_frame["year"].isin(splits["test"])]
         X_train, y_train, _ = make_xy(train_df, features, target_col)
+        X_val, y_val, _ = make_xy(val_df, features, target_col)
         X_test, y_test, meta_test = make_xy(test_df, features, target_col)
         for model_name in model_names:
             if model_name in {"logreg", "rf"}:
-                fitted = fit_predict_sklearn(model_name, X_train, y_train, X_test, random_state=random_state)
+                fitted = fit_predict_sklearn(
+                    model_name,
+                    X_train,
+                    y_train,
+                    X_test,
+                    X_val=X_val,
+                    y_val=y_val,
+                    random_state=random_state,
+                )
             elif model_name == "blitecast":
                 aligned = test_df.dropna(subset=[target_col]).copy()
                 fitted = predict_blitecast(aligned)
@@ -70,12 +80,24 @@ def run_experiments(
                 "tune_trials": tune_trials,
                 "primary_metric": "f1",
             }
+            if model_name == "logreg":
+                config["threshold"] = fitted.threshold
+                config["threshold_tuning"] = "validation_f1"
+                config["validation_metrics"] = fitted.validation_metrics or {}
+                config["validation_threshold_objective"] = fitted.threshold_objective
             run_dir, zip_path = save_experiment_artifacts(output_dir, model_name, metrics, predictions, report, config, splits)
             if upload_dataset:
                 persistent_dir = Path(output_dir) / "persistent_dataset"
                 copy_zip_to_persistent(zip_path, persistent_dir, dataset_slug or "")
                 upload_dataset_version(persistent_dir)
-            results.append({"model": model_name, "horizon": horizon, **metrics, "run_dir": str(run_dir), "zip_path": str(zip_path)})
+            results.append({
+                "model": model_name,
+                "horizon": horizon,
+                **metrics,
+                "threshold": fitted.threshold,
+                "run_dir": str(run_dir),
+                "zip_path": str(zip_path),
+            })
     results.sort(key=lambda row: (row["model"], -row["f1"]))
     if top_n is not None:
         limit = int(top_n)

@@ -20,7 +20,7 @@ def evaluate_binary(y_true, y_pred_binary) -> tuple[dict[str, float], pd.DataFra
 
 def threshold_objective_value(y_true: Iterable[int], y_score: Iterable[float], threshold: float) -> float:
     """Return the F1 score produced by applying ``threshold`` to positive-class scores."""
-    scores = np.asarray(list(y_score), dtype=float)
+    scores = np.nan_to_num(np.asarray(list(y_score), dtype=float), nan=-np.inf, posinf=1.0, neginf=-np.inf)
     y_pred = (scores >= float(threshold)).astype(int)
     return float(f1_score(y_true, y_pred, zero_division=0))
 
@@ -37,8 +37,6 @@ def search_threshold(y_true: Iterable[int], y_score: Iterable[float]) -> tuple[f
         return 0.5, 0.0
 
     finite_scores = scores[np.isfinite(scores)]
-    if finite_scores.size == 0:
-        return 0.5, 0.0
 
     candidates = np.unique(
         np.concatenate(
@@ -53,7 +51,7 @@ def search_threshold(y_true: Iterable[int], y_score: Iterable[float]) -> tuple[f
     best_value = -1.0
     best_distance = float("inf")
     for threshold in candidates:
-        value = threshold_objective_value(y_true, finite_scores, float(threshold))
+        value = threshold_objective_value(y_true, scores, float(threshold))
         distance = abs(float(threshold) - 0.5)
         if value > best_value or (value == best_value and (distance, threshold) < (best_distance, best_threshold)):
             best_threshold = float(threshold)

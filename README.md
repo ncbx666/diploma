@@ -65,13 +65,36 @@ For a local test outside Kaggle, use `--output-dir ./outputs`.
 python train.py --models all --horizons 2 3 --window-sizes 5 7 9 --top-n 2 --tune-trials 10
 ```
 
+Feature-engineering experiments from the reference notebooks are always run for
+each selected model/horizon/window combination. They are intentionally **not**
+CLI parameters, so the benchmark grid remains reproducible:
+
+- `baseline`
+- `interaction_fe`
+- `temporal_fe`
+- `tomek_only`
+- `tomek_interaction_fe`
+- `tomek_temporal_fe`
+- `tomek_interaction_temporal_fe`
+
+The variants come from `notebook08038a32e2 (1).ipynb` and
+`potato_illness_forecasting_benchmark (2).ipynb`: manual interaction features,
+within-year lag/rolling/trend features, and Tomek Links on the training split
+only.
+
 Supported model names in `train.py`:
 
 - `logreg`
 - `svm`
 - `rf`
-- `arima`
+- `gru`
 - `tft`
+- `blitecast`
+- `xgboost`
+- `catboost`
+- `lightgbm`
+- `arima`
+- `sarima`
 
 `all` expands to the full supported list. Optional models that require unavailable
 runtime packages are skipped with an explicit text artifact rather than a fake
@@ -91,8 +114,9 @@ substitute.
 ```
 
 F1 is the primary ranking criterion. Result folders include the model name and
-F1 score as a percentage, for example `outputs/svm_62/` for F1 ≈ 0.62. If a name
-already exists, a safe suffix is added.
+feature-engineering variant plus F1 score as a percentage, for example
+`outputs/svm_temporal_fe_62/` for F1 ≈ 0.62. If a name already exists, a safe
+suffix is added.
 
 ## 6. Outputs and zip files
 
@@ -101,6 +125,7 @@ Each experiment writes a result folder with artifacts such as:
 - `metrics.csv`
 - `predictions.csv` with required `y_pred_binary`
 - `classification_report.csv`
+- `classification_report.png`
 - `config_used.yaml`
 - `train_val_test_years.json`
 - plot files when they are applicable

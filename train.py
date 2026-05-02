@@ -61,6 +61,24 @@ RANDOM_STATE = 42
 DEFAULT_DATA_FILE = "Golitcino72-17d2_CLEAN.xlsx"
 DEFAULT_OUTPUT_DIR = Path("/kaggle/working/outputs")
 SUPPORTED_MODELS = ("logreg", "svm", "rf", "gru", "tft", "blitecast", "xgboost", "catboost", "lightgbm", "arima", "sarima")
+FEATURE_VARIANTS = (
+    "baseline",
+    "interaction_fe",
+    "temporal_fe",
+    "tomek_only",
+    "tomek_interaction_fe",
+    "tomek_temporal_fe",
+    "tomek_interaction_temporal_fe",
+)
+FEATURE_VARIANT_DESCRIPTIONS = {
+    "baseline": "Base predictors only.",
+    "interaction_fe": "Base predictors plus two manual interaction features.",
+    "temporal_fe": "Base predictors plus within-year lag, rolling, and trend features.",
+    "tomek_only": "Base predictors with Tomek Links applied on the training split only.",
+    "tomek_interaction_fe": "Interaction features plus Tomek Links on the training split only.",
+    "tomek_temporal_fe": "Temporal features plus Tomek Links on the training split only.",
+    "tomek_interaction_temporal_fe": "Interaction features, temporal features, and Tomek Links on the training split only.",
+}
 FEATURE_COLUMNS = [
     "day",
     "t_min",
@@ -78,11 +96,31 @@ FEATURE_COLUMNS = [
     "t_gt_10",
 ]
 ZERO_FILL_COLUMNS = {"is_rain", "precipitation", "precipitation_t_gt_10"}
+INTERACTION_FEATURE_COLUMNS = ["fe_y4_cloud_interaction", "fe_cold_rain_index"]
+TEMPORAL_SOURCE_COLUMNS = [
+    "t_min",
+    "t_max",
+    "is_rain",
+    "y1",
+    "y2",
+    "y2_y1",
+    "precipitation",
+    "t_avg",
+    "cloudiness",
+    "y3",
+    "y4",
+    "precipitation_t_gt_10",
+    "t_gt_10",
+]
+TEMPORAL_LAG_STEPS = [1, 2, 3, 7]
+TEMPORAL_ROLLING_WINDOWS = [3, 7]
+TEMPORAL_ROLLING_STATS = ["mean", "std", "min", "max"]
 
 
 @dataclass
 class ExperimentResult:
     model: str
+    variant: str
     horizon: int
     window_size: int
     f1: float
@@ -202,7 +240,9 @@ def split_years(df: pd.DataFrame) -> tuple[list[int], list[int], list[int]]:
     return train_years, val_years, test_years
 
 
-def prepare_features(df: pd.DataFrame, target_col: str, window_size: int) -> tuple[pd.DataFrame, list[str]]:
+def prepare_features(df: pd.DataFrame, target_col: str, window_size: int, variant: str) -> tuple[pd.DataFrame, list[str]]:
+    if variant not in FEATURE_VARIANTS:
+        raise ValueError(f"Unknown feature variant: {variant}")
     work = df.copy().sort_values(["year", "day"]).reset_index(drop=True)
     for col in FEATURE_COLUMNS:
         if col in ZERO_FILL_COLUMNS:
@@ -210,15 +250,74 @@ def prepare_features(df: pd.DataFrame, target_col: str, window_size: int) -> tup
         work[col] = work.groupby("year")[col].transform(lambda s: s.ffill().bfill())
         work[col] = work[col].fillna(work[col].median())
     feature_cols = FEATURE_COLUMNS.copy()
-    for col in ["t_min", "t_max", "precipitation", "t_avg", "cloudiness", "y1", "y2", "y3", "y4"]:
-        lag_col = f"{col}_lag_{window_size}"
-        roll_col = f"{col}_roll_{window_size}_mean"
-        work[lag_col] = work.groupby("year")[col].shift(window_size)
-        work[roll_col] = work.groupby("year")[col].transform(lambda s: s.rolling(window_size, min_periods=1).mean())
-        feature_cols.extend([lag_col, roll_col])
+
+    if "interaction" in variant:
+        work["fe_y4_cloud_interaction"] = work["y4"] * work["cloudiness"]
+        work["fe_cold_rain_index"] = work["is_rain"] * (35 - work["t_avg"])
+        feature_cols.extend(INTERACTION_FEATURE_COLUMNS)
+
+    if "temporal" in variant:
+        grouped = work.groupby("year", sort=False)
+        for col in TEMPORAL_SOURCE_COLUMNS:
+            for lag in TEMPORAL_LAG_STEPS:
+                lag_col = f"{col}_lag_{lag}"
+                work[lag_col] = grouped[col].shift(lag)
+                feature_cols.append(lag_col)
+            for rolling_window in TEMPORAL_ROLLING_WINDOWS:
+                rolled = grouped[col].rolling(rolling_window, min_periods=rolling_window)
+                for stat in TEMPORAL_ROLLING_STATS:
+                    roll_col = f"{col}_roll_{rolling_window}_{stat}"
+                    if stat == "mean":
+                        values = rolled.mean()
+                    elif stat == "std":
+                        values = rolled.std()
+                    elif stat == "min":
+                        values = rolled.min()
+                    elif stat == "max":
+                        values = rolled.max()
+                    else:
+                        raise ValueError(stat)
+                    work[roll_col] = values.reset_index(level=0, drop=True)
+                    feature_cols.append(roll_col)
+            trend_col = f"{col}_trend_3_vs_prev3"
+            current_mean = grouped[col].rolling(3, min_periods=3).mean().reset_index(level=0, drop=True)
+            previous_mean = (
+                work.groupby("year")[col]
+                .shift(3)
+                .groupby(work["year"])
+                .rolling(3, min_periods=3)
+                .mean()
+                .reset_index(level=0, drop=True)
+            )
+            work[trend_col] = current_mean - previous_mean
+            feature_cols.append(trend_col)
+
+    feature_cols = list(dict.fromkeys(feature_cols))
     work = work.dropna(subset=[target_col]).copy()
     work[target_col] = work[target_col].round().clip(0, 1).astype(int)
     return work, feature_cols
+
+
+def apply_tomek_if_needed(
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    variant: str,
+) -> tuple[pd.DataFrame, pd.Series, str | None]:
+    if "tomek" not in variant:
+        return x_train, y_train, None
+    try:
+        from imblearn.under_sampling import TomekLinks
+    except ImportError as exc:
+        raise ImportError("Tomek feature variants require imbalanced-learn from requirements.txt.") from exc
+
+    sampler = TomekLinks()
+    sample_frame = x_train.replace([np.inf, -np.inf], np.nan)
+    medians = sample_frame.median(numeric_only=True).fillna(0)
+    sample_frame = sample_frame.fillna(medians).fillna(0)
+    x_resampled, y_resampled = sampler.fit_resample(sample_frame, y_train)
+    removed = len(x_train) - len(x_resampled)
+    note = f"Tomek Links applied to training split only; removed {removed} rows."
+    return pd.DataFrame(x_resampled, columns=x_train.columns), pd.Series(y_resampled, name=y_train.name), note
 
 
 def choose_models(raw_models: list[str]) -> list[str]:
@@ -450,15 +549,16 @@ def write_confusion_png(path: Path, y_true: np.ndarray, y_pred: np.ndarray) -> N
     path.write_bytes(png)
 
 
-def safe_folder_name(output_root: Path, model: str, f1_value: float) -> Path:
+def safe_folder_name(output_root: Path, model: str, f1_value: float, variant: str | None = None) -> Path:
     score = int(round(max(0.0, min(1.0, f1_value)) * 100))
-    base = output_root / f"{model}_{score:02d}"
+    prefix = f"{model}_{variant}" if variant else model
+    base = output_root / f"{prefix}_{score:02d}"
     if not base.exists():
         return base
     suffix = 2
-    while (output_root / f"{model}_{score:02d}_{suffix}").exists():
+    while (output_root / f"{prefix}_{score:02d}_{suffix}").exists():
         suffix += 1
-    return output_root / f"{model}_{score:02d}_{suffix}"
+    return output_root / f"{prefix}_{score:02d}_{suffix}"
 
 
 def save_plots(result_dir: Path, y_true: np.ndarray, y_pred: np.ndarray, y_score: np.ndarray | None, estimator: Any, feature_cols: list[str]) -> None:
@@ -573,6 +673,7 @@ def maybe_upload(zip_path: Path, output_root: Path, upload: bool, dataset_slug: 
 
 def run_one(
     model: str,
+    variant: str,
     horizon: int,
     window_size: int,
     df: pd.DataFrame,
@@ -582,16 +683,16 @@ def run_one(
     args: argparse.Namespace,
 ) -> ExperimentResult | None:
     target_col = f"target_h{horizon}"
-    prepared, feature_cols = prepare_features(df, target_col, window_size)
+    prepared, feature_cols = prepare_features(df, target_col, window_size, variant)
     train_df = prepared[prepared["year"].isin(train_years)].copy()
     val_df = prepared[prepared["year"].isin(val_years)].copy()
     test_df = prepared[prepared["year"].isin(test_years)].copy()
     if train_df.empty or test_df.empty:
-        print(f"SKIP {model} h{horizon} w{window_size}: empty train/test split")
+        print(f"SKIP {model} variant={variant} h{horizon} w{window_size}: empty train/test split")
         return None
 
     if model in {"gru", "tft"}:
-        result_dir = safe_folder_name(args.output_dir, model, 0.0)
+        result_dir = safe_folder_name(args.output_dir, model, 0.0, variant)
         result_dir.mkdir(parents=True, exist_ok=True)
         reason = (
             "gru skipped: GRU training requires the PyTorch sequence-model path from the notebook; "
@@ -601,14 +702,17 @@ def run_one(
             "no artificial fallback was created."
         )
         (result_dir / "skipped_model.txt").write_text(reason + "\n", encoding="utf-8")
-        write_config(result_dir / "config_used.yaml", vars(args) | {"model": model, "horizon": horizon, "window_size": window_size})
+        write_config(result_dir / "config_used.yaml", vars(args) | {"model": model, "variant": variant, "horizon": horizon, "window_size": window_size})
         zip_path = zip_result(result_dir, args.output_dir)
         maybe_upload(zip_path, args.output_dir, args.upload_dataset, args.dataset_slug)
-        return ExperimentResult(model, horizon, window_size, 0.0, result_dir, zip_path)
+        return ExperimentResult(model, variant, horizon, window_size, 0.0, result_dir, zip_path)
 
     x_train, y_train = train_df[feature_cols], train_df[target_col].astype(int)
     x_val, y_val = val_df[feature_cols], val_df[target_col].astype(int)
     x_test, y_test = test_df[feature_cols], test_df[target_col].astype(int)
+    tomek_note = None
+    if model not in {"arima", "sarima"}:
+        x_train, y_train, tomek_note = apply_tomek_if_needed(x_train, y_train, variant)
 
     best_params: dict[str, Any] = {}
     if model in {"logreg", "svm", "rf", "xgboost", "catboost", "lightgbm"}:
@@ -650,17 +754,21 @@ def run_one(
     precision = float(precision_score(y_test, y_pred, zero_division=0))
     recall = float(recall_score(y_test, y_pred, zero_division=0))
     accuracy = float(accuracy_score(y_test, y_pred))
-    result_dir = safe_folder_name(args.output_dir, model, f1)
+    result_dir = safe_folder_name(args.output_dir, model, f1, variant)
     result_dir.mkdir(parents=True, exist_ok=True)
 
     metrics = [{
         "model": model,
+        "variant": variant,
+        "variant_description": FEATURE_VARIANT_DESCRIPTIONS[variant],
         "horizon": horizon,
         "window_size": window_size,
         "f1": f1,
         "precision": precision,
         "recall": recall,
         "accuracy": accuracy,
+        "feature_count": len(feature_cols),
+        "tomek_note": tomek_note or "",
         "best_params": json.dumps(best_params, ensure_ascii=False),
     }]
     write_csv(result_dir / "metrics.csv", metrics)
@@ -681,7 +789,21 @@ def run_one(
         plt.close(fig)
     else:
         write_placeholder_png(result_dir / "classification_report.png")
-    write_config(result_dir / "config_used.yaml", vars(args) | {"model": model, "horizon": horizon, "window_size": window_size, "best_params": best_params})
+    write_config(
+        result_dir / "config_used.yaml",
+        vars(args)
+        | {
+            "model": model,
+            "variant": variant,
+            "variant_description": FEATURE_VARIANT_DESCRIPTIONS[variant],
+            "horizon": horizon,
+            "window_size": window_size,
+            "feature_count": len(feature_cols),
+            "feature_columns": feature_cols,
+            "tomek_note": tomek_note or "",
+            "best_params": best_params,
+        },
+    )
     (result_dir / "train_val_test_years.json").write_text(
         json.dumps({"train": train_years, "validation": val_years, "test": test_years}, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -689,18 +811,20 @@ def run_one(
     save_plots(result_dir, np.asarray(y_test, dtype=int), np.asarray(y_pred, dtype=int), y_score, estimator, feature_cols)
     zip_path = zip_result(result_dir, args.output_dir)
     maybe_upload(zip_path, args.output_dir, args.upload_dataset, args.dataset_slug)
-    print(f"DONE {model} horizon={horizon} window={window_size} f1={f1:.3f} -> {result_dir} zip={zip_path}")
-    return ExperimentResult(model, horizon, window_size, f1, result_dir, zip_path)
+    print(f"DONE {model} variant={variant} horizon={horizon} window={window_size} f1={f1:.3f} -> {result_dir} zip={zip_path}")
+    return ExperimentResult(model, variant, horizon, window_size, f1, result_dir, zip_path)
 
 
-def enforce_top_n(results: list[ExperimentResult], top_n: int) -> None:
+def enforce_top_n(results: list[ExperimentResult], top_n: int) -> list[ExperimentResult]:
     if top_n <= 0:
-        return
+        return results
     by_model: dict[str, list[ExperimentResult]] = {}
     for result in results:
         by_model.setdefault(result.model, []).append(result)
+    kept_results: list[ExperimentResult] = []
     for model_results in by_model.values():
         keep = sorted(model_results, key=lambda r: r.f1, reverse=True)[:top_n]
+        kept_results.extend(keep)
         keep_dirs = {r.output_dir for r in keep}
         keep_zips = {r.zip_path for r in keep}
         for result in model_results:
@@ -708,6 +832,7 @@ def enforce_top_n(results: list[ExperimentResult], top_n: int) -> None:
                 shutil.rmtree(result.output_dir)
             if result.zip_path not in keep_zips and result.zip_path.exists():
                 result.zip_path.unlink()
+    return sorted(kept_results, key=lambda row: (row.model, -row.f1))
 
 
 def main() -> int:
@@ -728,10 +853,11 @@ def main() -> int:
     for model in models:
         for horizon in args.horizons:
             for window_size in args.window_sizes:
-                result = run_one(model, horizon, window_size, df, train_years, val_years, test_years, args)
-                if result is not None:
-                    results.append(result)
-    enforce_top_n(results, args.top_n)
+                for variant in FEATURE_VARIANTS:
+                    result = run_one(model, variant, horizon, window_size, df, train_years, val_years, test_years, args)
+                    if result is not None:
+                        results.append(result)
+    results = enforce_top_n(results, args.top_n)
     summary_rows = [r.__dict__ | {"output_dir": str(r.output_dir), "zip_path": str(r.zip_path)} for r in results]
     write_csv(args.output_dir / "summary.csv", summary_rows)
     return 0

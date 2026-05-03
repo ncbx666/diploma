@@ -29,12 +29,14 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     classification_report,
     confusion_matrix,
     f1_score,
     precision_recall_curve,
     precision_score,
     recall_score,
+    roc_auc_score,
     roc_curve,
 )
 from sklearn.pipeline import Pipeline
@@ -59,6 +61,8 @@ except Exception:  # pragma: no cover - depends on runtime
 
 RANDOM_STATE = 42
 MIN_PRECISION = 0.60
+VAL_YEAR_COUNT = 6
+TEST_YEAR_COUNT = 6
 DEFAULT_DATA_FILE = "Golitcino72-17d2_CLEAN.xlsx"
 DEFAULT_OUTPUT_DIR = Path("/kaggle/working/outputs")
 SUPPORTED_MODELS = ("logreg", "svm", "rf", "gru", "tft", "blitecast", "xgboost", "catboost", "lightgbm", "arima", "sarima")
@@ -133,6 +137,10 @@ class ExperimentResult:
     horizon: int
     window_size: int
     f1: float
+    precision: float
+    recall: float
+    pr_auc: float
+    roc_auc: float
     output_dir: Path
     zip_path: Path
     threshold: float | None = None
@@ -148,7 +156,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models", nargs="+", default=["logreg"], help="Models to run or 'all'.")
     parser.add_argument("--horizons", nargs="+", type=int, default=[2], help="Forecast horizons, e.g. --horizons 2 3")
     parser.add_argument("--window-sizes", nargs="+", type=int, default=[7], help="Window sizes, e.g. --window-sizes 5 7 9")
-    parser.add_argument("--top-n", type=int, default=1, help="Keep only N best results per model ranked by F1.")
+    parser.add_argument("--top-n", type=int, default=1, help="Keep only N best results per model ranked by the notebook rule.")
     parser.add_argument("--tune-trials", type=int, default=0, help="Number of Optuna trials per tunable experiment.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Output root directory.")
     parser.add_argument("--upload-dataset", action="store_true", help="Upload zips to a Kaggle Dataset after each experiment.")
@@ -242,27 +250,48 @@ def add_targets(df: pd.DataFrame, horizons: Iterable[int]) -> pd.DataFrame:
 
 def split_years(df: pd.DataFrame) -> tuple[list[int], list[int], list[int]]:
     years = sorted(int(y) for y in df["year"].dropna().unique())
-    if len(years) < 3:
-        raise ValueError("Need at least 3 years for train/validation/test split.")
-    test_count = min(5, max(1, len(years) // 5))
-    val_count = min(7, max(1, (len(years) - test_count) // 5))
-    train_years = years[: -(val_count + test_count)]
-    val_years = years[-(val_count + test_count) : -test_count]
-    test_years = years[-test_count:]
-    if not train_years:
-        train_years, val_years, test_years = years[:-2], [years[-2]], [years[-1]]
+    if len(years) <= VAL_YEAR_COUNT + TEST_YEAR_COUNT:
+        raise ValueError("Not enough years for notebook train/validation/test split.")
+    train_years = years[: -(VAL_YEAR_COUNT + TEST_YEAR_COUNT)]
+    val_years = years[-(VAL_YEAR_COUNT + TEST_YEAR_COUNT) : -TEST_YEAR_COUNT]
+    test_years = years[-TEST_YEAR_COUNT:]
     return train_years, val_years, test_years
 
 
-def prepare_features(df: pd.DataFrame, target_col: str, window_size: int, variant: str) -> tuple[pd.DataFrame, list[str]]:
+def fill_weather_missing(
+    df: pd.DataFrame,
+    fill_values: dict[str, float] | None = None,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Notebook-compatible weather imputation.
+
+    The training split derives fallback medians. Validation and test splits reuse
+    those values, avoiding cross-split leakage. Within each year, missing values
+    are forward-filled only, matching the reference notebook.
+    """
+    work = df.copy().sort_values(["year", "day"]).reset_index(drop=True)
+    for col in ZERO_FILL_COLUMNS:
+        if col in work.columns:
+            work[col] = work[col].fillna(0.0)
+    fill_columns = list(dict.fromkeys(FEATURE_COLUMNS + TEMPORAL_SOURCE_COLUMNS))
+    for col in fill_columns:
+        if col in work.columns:
+            work[col] = work.groupby("year")[col].transform(lambda s: s.ffill())
+    if fill_values is None:
+        fill_values = {
+            col: float(work[col].median())
+            for col in fill_columns
+            if col in work.columns and not work[col].dropna().empty
+        }
+    for col in fill_columns:
+        if col in work.columns:
+            work[col] = work[col].fillna(fill_values.get(col, 0.0))
+    return work, fill_values
+
+
+def add_variant_features(df: pd.DataFrame, window_size: int, variant: str) -> tuple[pd.DataFrame, list[str]]:
     if variant not in FEATURE_VARIANTS:
         raise ValueError(f"Unknown feature variant: {variant}")
     work = df.copy().sort_values(["year", "day"]).reset_index(drop=True)
-    for col in FEATURE_COLUMNS:
-        if col in ZERO_FILL_COLUMNS:
-            work[col] = work[col].fillna(0.0)
-        work[col] = work.groupby("year")[col].transform(lambda s: s.ffill().bfill())
-        work[col] = work[col].fillna(work[col].median())
     feature_cols = FEATURE_COLUMNS.copy()
 
     if "interaction" in variant:
@@ -307,9 +336,51 @@ def prepare_features(df: pd.DataFrame, target_col: str, window_size: int, varian
             feature_cols.append(trend_col)
 
     feature_cols = list(dict.fromkeys(feature_cols))
-    work = work.dropna(subset=[target_col]).copy()
-    work[target_col] = work[target_col].round().clip(0, 1).astype(int)
     return work, feature_cols
+
+
+def finalize_prepared_split(frame: pd.DataFrame, feature_cols: list[str], target_col: str) -> pd.DataFrame:
+    cols = ["year", "day", target_col] + feature_cols
+    subset = frame[cols].dropna().reset_index(drop=True)
+    subset[target_col] = subset[target_col].round().clip(0, 1).astype(int)
+    return subset
+
+
+def prepare_features(df: pd.DataFrame, target_col: str, window_size: int, variant: str) -> tuple[pd.DataFrame, list[str]]:
+    """Backward-compatible single-frame feature preparation."""
+    filled, _ = fill_weather_missing(df)
+    work, feature_cols = add_variant_features(filled, window_size, variant)
+    return finalize_prepared_split(work, feature_cols, target_col), feature_cols
+
+
+def prepare_feature_splits(
+    df: pd.DataFrame,
+    target_col: str,
+    window_size: int,
+    variant: str,
+    train_years: list[int],
+    val_years: list[int],
+    test_years: list[int],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str], dict[str, float]]:
+    train_raw = df[df["year"].isin(train_years)].copy()
+    val_raw = df[df["year"].isin(val_years)].copy()
+    test_raw = df[df["year"].isin(test_years)].copy()
+
+    train_filled, fill_values = fill_weather_missing(train_raw)
+    val_filled, _ = fill_weather_missing(val_raw, fill_values)
+    test_filled, _ = fill_weather_missing(test_raw, fill_values)
+
+    train_frame, feature_cols = add_variant_features(train_filled, window_size, variant)
+    val_frame, _ = add_variant_features(val_filled, window_size, variant)
+    test_frame, _ = add_variant_features(test_filled, window_size, variant)
+
+    return (
+        finalize_prepared_split(train_frame, feature_cols, target_col),
+        finalize_prepared_split(val_frame, feature_cols, target_col),
+        finalize_prepared_split(test_frame, feature_cols, target_col),
+        feature_cols,
+        fill_values,
+    )
 
 
 def apply_tomek_if_needed(
@@ -350,7 +421,7 @@ def normalize_logreg_params(params: dict[str, Any] | None = None) -> dict[str, A
     if variant:
         params.update(LOGREG_SOLVER_PENALTIES[variant])
     params.setdefault("C", 1.0)
-    params.setdefault("solver", "lbfgs")
+    params.setdefault("solver", "liblinear")
     params.setdefault("penalty", "l2")
     params.setdefault("class_weight", "balanced")
     params.setdefault("max_iter", 3000)
@@ -468,6 +539,42 @@ def validation_metrics(y_true: pd.Series | np.ndarray, scores: np.ndarray, thres
         "val_f1": float(f1_score(y_true_arr, y_pred, zero_division=0)),
         "val_accuracy": float(accuracy_score(y_true_arr, y_pred)),
     }
+
+
+def safe_roc_auc(y_true: pd.Series | np.ndarray, scores: np.ndarray | None) -> float:
+    if scores is None:
+        return float("nan")
+    y_arr = np.asarray(y_true).astype(int).reshape(-1)
+    score_arr = np.asarray(scores, dtype=float).reshape(-1)
+    usable = min(y_arr.size, score_arr.size)
+    if usable == 0 or len(np.unique(y_arr[:usable])) < 2:
+        return float("nan")
+    return float(roc_auc_score(y_arr[:usable], score_arr[:usable]))
+
+
+def safe_pr_auc(y_true: pd.Series | np.ndarray, scores: np.ndarray | None) -> float:
+    if scores is None:
+        return float("nan")
+    y_arr = np.asarray(y_true).astype(int).reshape(-1)
+    score_arr = np.asarray(scores, dtype=float).reshape(-1)
+    usable = min(y_arr.size, score_arr.size)
+    if usable == 0 or len(np.unique(y_arr[:usable])) < 2:
+        return float("nan")
+    return float(average_precision_score(y_arr[:usable], score_arr[:usable]))
+
+
+def notebook_rank_key_values(precision: float, recall: float, pr_auc: float, f1: float, roc_auc: float) -> tuple[int, float, float, float, float]:
+    return (
+        int(np.nan_to_num(precision, nan=-1.0) >= MIN_PRECISION),
+        float(np.nan_to_num(recall, nan=-1.0)),
+        float(np.nan_to_num(pr_auc, nan=-1.0)),
+        float(np.nan_to_num(f1, nan=-1.0)),
+        float(np.nan_to_num(roc_auc, nan=-1.0)),
+    )
+
+
+def result_rank_key(result: ExperimentResult) -> tuple[int, float, float, float, float]:
+    return notebook_rank_key_values(result.precision, result.recall, result.pr_auc, result.f1, result.roc_auc)
 
 
 def tune_params(model: str, x_train: pd.DataFrame, y_train: pd.Series, x_val: pd.DataFrame, y_val: pd.Series, trials: int) -> dict[str, Any]:
@@ -808,10 +915,15 @@ def run_one(
     args: argparse.Namespace,
 ) -> ExperimentResult | None:
     target_col = f"target_h{horizon}"
-    prepared, feature_cols = prepare_features(df, target_col, window_size, variant)
-    train_df = prepared[prepared["year"].isin(train_years)].copy()
-    val_df = prepared[prepared["year"].isin(val_years)].copy()
-    test_df = prepared[prepared["year"].isin(test_years)].copy()
+    train_df, val_df, test_df, feature_cols, fill_values = prepare_feature_splits(
+        df,
+        target_col,
+        window_size,
+        variant,
+        train_years,
+        val_years,
+        test_years,
+    )
     if train_df.empty or test_df.empty:
         print(f"SKIP {model} variant={variant} h{horizon} w{window_size}: empty train/test split")
         return None
@@ -830,7 +942,7 @@ def run_one(
         write_config(result_dir / "config_used.yaml", vars(args) | {"model": model, "variant": variant, "horizon": horizon, "window_size": window_size})
         zip_path = zip_result(result_dir, args.output_dir)
         maybe_upload(zip_path, args.output_dir, args.upload_dataset, args.dataset_slug)
-        return ExperimentResult(model, variant, horizon, window_size, 0.0, result_dir, zip_path)
+        return ExperimentResult(model, variant, horizon, window_size, 0.0, 0.0, 0.0, float("nan"), float("nan"), result_dir, zip_path)
 
     x_train, y_train = train_df[feature_cols], train_df[target_col].astype(int)
     x_val, y_val = val_df[feature_cols], val_df[target_col].astype(int)
@@ -913,6 +1025,15 @@ def run_one(
     precision = float(precision_score(y_test, y_pred, zero_division=0))
     recall = float(recall_score(y_test, y_pred, zero_division=0))
     accuracy = float(accuracy_score(y_test, y_pred))
+    pr_auc = safe_pr_auc(y_test, y_score)
+    roc_auc = safe_roc_auc(y_test, y_score)
+    precision_floor_met, rank_recall, rank_pr_auc, rank_f1, rank_roc_auc = notebook_rank_key_values(
+        precision,
+        recall,
+        pr_auc,
+        f1,
+        roc_auc,
+    )
     result_dir = safe_folder_name(args.output_dir, model, f1, variant)
     result_dir.mkdir(parents=True, exist_ok=True)
 
@@ -926,6 +1047,10 @@ def run_one(
         "precision": precision,
         "recall": recall,
         "accuracy": accuracy,
+        "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
+        "precision_floor_met": bool(precision_floor_met),
+        "rank_rule": "precision>=0.60 -> recall -> pr_auc -> f1 -> roc_auc",
         "threshold": selected_threshold,
         "threshold_objective": threshold_info.get("objective"),
         "val_precision": val_metric_values.get("val_precision"),
@@ -980,10 +1105,17 @@ def run_one(
             "window_size": window_size,
             "feature_count": len(feature_cols),
             "feature_columns": feature_cols,
+            "imputation": "notebook: train median fallback, validation/test reuse train fill values, year-wise forward fill only",
+            "fill_values": fill_values,
             "tomek_note": tomek_note or "",
             "best_params": best_params,
             "threshold": selected_threshold,
             "threshold_objective": threshold_info.get("objective"),
+            "roc_auc": roc_auc,
+            "pr_auc": pr_auc,
+            "precision_floor_met": bool(precision_floor_met),
+            "rank_rule": "precision>=0.60 -> recall -> pr_auc -> f1 -> roc_auc",
+            "rank_key": [precision_floor_met, rank_recall, rank_pr_auc, rank_f1, rank_roc_auc],
             **val_metric_values,
         },
     )
@@ -1001,6 +1133,10 @@ def run_one(
         horizon,
         window_size,
         f1,
+        precision,
+        recall,
+        pr_auc,
+        roc_auc,
         result_dir,
         zip_path,
         threshold=selected_threshold,
@@ -1019,7 +1155,7 @@ def enforce_top_n(results: list[ExperimentResult], top_n: int) -> list[Experimen
         by_model.setdefault(result.model, []).append(result)
     kept_results: list[ExperimentResult] = []
     for model_results in by_model.values():
-        keep = sorted(model_results, key=lambda r: r.f1, reverse=True)[:top_n]
+        keep = sorted(model_results, key=result_rank_key, reverse=True)[:top_n]
         kept_results.extend(keep)
         keep_dirs = {r.output_dir for r in keep}
         keep_zips = {r.zip_path for r in keep}
@@ -1028,7 +1164,17 @@ def enforce_top_n(results: list[ExperimentResult], top_n: int) -> list[Experimen
                 shutil.rmtree(result.output_dir)
             if result.zip_path not in keep_zips and result.zip_path.exists():
                 result.zip_path.unlink()
-    return sorted(kept_results, key=lambda row: (row.model, -row.f1))
+    return sorted(
+        kept_results,
+        key=lambda row: (
+            row.model,
+            -result_rank_key(row)[0],
+            -result_rank_key(row)[1],
+            -result_rank_key(row)[2],
+            -result_rank_key(row)[3],
+            -result_rank_key(row)[4],
+        ),
+    )
 
 
 def main() -> int:
@@ -1054,7 +1200,19 @@ def main() -> int:
                     if result is not None:
                         results.append(result)
     results = enforce_top_n(results, args.top_n)
-    summary_rows = [r.__dict__ | {"output_dir": str(r.output_dir), "zip_path": str(r.zip_path)} for r in results]
+    summary_rows = []
+    for result in results:
+        rank_key = result_rank_key(result)
+        summary_rows.append(
+            result.__dict__
+            | {
+                "output_dir": str(result.output_dir),
+                "zip_path": str(result.zip_path),
+                "precision_floor_met": bool(rank_key[0]),
+                "rank_rule": "precision>=0.60 -> recall -> pr_auc -> f1 -> roc_auc",
+                "rank_key": json.dumps(list(rank_key)),
+            }
+        )
     write_csv(args.output_dir / "summary.csv", summary_rows)
     return 0
 

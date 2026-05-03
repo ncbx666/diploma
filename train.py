@@ -116,6 +116,14 @@ TEMPORAL_SOURCE_COLUMNS = [
 TEMPORAL_LAG_STEPS = [1, 2, 3, 7]
 TEMPORAL_ROLLING_WINDOWS = [3, 7]
 TEMPORAL_ROLLING_STATS = ["mean", "std", "min", "max"]
+LOGREG_SOLVER_PENALTIES = {
+    "lbfgs_l2": {"solver": "lbfgs", "penalty": "l2"},
+    "liblinear_l1": {"solver": "liblinear", "penalty": "l1"},
+    "liblinear_l2": {"solver": "liblinear", "penalty": "l2"},
+    "saga_l1": {"solver": "saga", "penalty": "l1"},
+    "saga_l2": {"solver": "saga", "penalty": "l2"},
+    "saga_elasticnet": {"solver": "saga", "penalty": "elasticnet"},
+}
 
 
 @dataclass
@@ -336,13 +344,54 @@ def choose_models(raw_models: list[str]) -> list[str]:
     return requested
 
 
+def normalize_logreg_params(params: dict[str, Any] | None = None) -> dict[str, Any]:
+    params = dict(params or {})
+    variant = params.pop("solver_penalty", None)
+    if variant:
+        params.update(LOGREG_SOLVER_PENALTIES[variant])
+    params.setdefault("C", 1.0)
+    params.setdefault("solver", "lbfgs")
+    params.setdefault("penalty", "l2")
+    params.setdefault("class_weight", "balanced")
+    params.setdefault("max_iter", 3000)
+    if params["solver"] == "saga" and params["penalty"] == "elasticnet":
+        params.setdefault("l1_ratio", 0.5)
+    else:
+        params.pop("l1_ratio", None)
+    return params
+
+
+def suggest_logreg_params(trial: Any) -> dict[str, Any]:
+    variant = trial.suggest_categorical("solver_penalty", list(LOGREG_SOLVER_PENALTIES))
+    params = {
+        "solver_penalty": variant,
+        "C": trial.suggest_float("C", 1e-3, 30.0, log=True),
+        "class_weight": trial.suggest_categorical("class_weight", [None, "balanced"]),
+        "max_iter": 3000,
+    }
+    if variant == "saga_elasticnet":
+        params["l1_ratio"] = trial.suggest_float("l1_ratio", 0.05, 0.95)
+    return normalize_logreg_params(params)
+
+
 def build_estimator(model: str, params: dict[str, Any] | None = None) -> Any:
     params = params or {}
     if model == "logreg":
+        logreg_params = normalize_logreg_params(params)
+        clf_kwargs = {
+            "C": logreg_params["C"],
+            "solver": logreg_params["solver"],
+            "penalty": logreg_params["penalty"],
+            "class_weight": logreg_params["class_weight"],
+            "max_iter": logreg_params["max_iter"],
+            "random_state": RANDOM_STATE,
+        }
+        if "l1_ratio" in logreg_params:
+            clf_kwargs["l1_ratio"] = logreg_params["l1_ratio"]
         return Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
-            ("model", LogisticRegression(C=params.get("C", 1.0), max_iter=1000, class_weight="balanced", random_state=RANDOM_STATE)),
+            ("model", LogisticRegression(**clf_kwargs)),
         ])
     if model == "svm":
         return Pipeline([
@@ -360,10 +409,10 @@ def build_estimator(model: str, params: dict[str, Any] | None = None) -> Any:
     raise ValueError(f"Model {model} is not a tabular sklearn estimator.")
 
 
-def threshold_objective_value(recall_value: float, precision_value: float) -> float:
+def threshold_objective_value(recall_value: float, precision_value: float, f1_value: float = 0.0) -> float:
     if precision_value >= MIN_PRECISION:
-        return 1.0 + recall_value + 0.001 * precision_value
-    return precision_value + 0.001 * recall_value
+        return 1.0 + recall_value + 0.001 * precision_value + 0.000001 * f1_value
+    return precision_value + 0.001 * recall_value + 0.000001 * f1_value
 
 
 def search_threshold(y_true: np.ndarray, scores: np.ndarray) -> dict[str, float]:
@@ -394,7 +443,7 @@ def search_threshold(y_true: np.ndarray, scores: np.ndarray) -> dict[str, float]
             "recall": float(recall_value),
             "precision": float(precision_value),
             "f1": float(f1_value),
-            "objective": float(threshold_objective_value(recall_value, precision_value)),
+            "objective": float(threshold_objective_value(recall_value, precision_value, f1_value)),
         })
 
     candidates_df = pd.DataFrame(candidates)
@@ -427,7 +476,7 @@ def tune_params(model: str, x_train: pd.DataFrame, y_train: pd.Series, x_val: pd
 
     def objective(trial: Any) -> float:
         if model == "logreg":
-            params = {"C": trial.suggest_float("C", 0.01, 10.0, log=True)}
+            params = suggest_logreg_params(trial)
         elif model == "svm":
             params = {"C": trial.suggest_float("C", 0.1, 20.0, log=True), "gamma": trial.suggest_categorical("gamma", ["scale", "auto"])}
         elif model == "rf":
@@ -446,12 +495,14 @@ def tune_params(model: str, x_train: pd.DataFrame, y_train: pd.Series, x_val: pd
                     pred = estimator.predict(x_val)
                     return f1_score(y_val, pred, zero_division=0)
                 threshold_info = search_threshold(y_val.to_numpy(dtype=int), val_scores)
-                return threshold_objective_value(threshold_info["recall"], threshold_info["precision"])
+                return threshold_objective_value(threshold_info["recall"], threshold_info["precision"], threshold_info["f1"])
             pred = estimator.predict(x_val)
         return f1_score(y_val, pred, zero_division=0)
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=trials, show_progress_bar=False)
+    if model == "logreg":
+        return normalize_logreg_params(dict(study.best_params))
     return dict(study.best_params)
 
 

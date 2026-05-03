@@ -21,11 +21,16 @@ def evaluate_binary(y_true, y_pred_binary) -> tuple[dict[str, float], pd.DataFra
 MIN_PRECISION = 0.60
 
 
-def threshold_objective_value(recall_value: float, precision_value: float, min_precision: float = MIN_PRECISION) -> float:
+def threshold_objective_value(
+    recall_value: float,
+    precision_value: float,
+    min_precision: float = MIN_PRECISION,
+    f1_value: float = 0.0,
+) -> float:
     """Notebook-style objective: meet precision floor first, then maximize recall."""
     if precision_value >= min_precision:
-        return 1.0 + float(recall_value) + 0.001 * float(precision_value)
-    return float(precision_value) + 0.001 * float(recall_value)
+        return 1.0 + float(recall_value) + 0.001 * float(precision_value) + 0.000001 * float(f1_value)
+    return float(precision_value) + 0.001 * float(recall_value) + 0.000001 * float(f1_value)
 
 
 def search_threshold(
@@ -63,7 +68,7 @@ def search_threshold(
             "precision": precision,
             "recall": recall,
             "f1": f1,
-            "objective": threshold_objective_value(recall, precision, min_precision),
+            "objective": threshold_objective_value(recall, precision, min_precision, f1),
         })
 
     candidates_df = pd.DataFrame(rows)

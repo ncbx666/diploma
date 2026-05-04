@@ -127,6 +127,10 @@ ORACLE_DEFAULT_PREDICT_FEATURES = [
     "precipitation",
     "is_rain",
     "cloudiness",
+]
+ORACLE_RAW_WINDOW_OFFSETS = [0, 1, 2, 3, 4]
+ORACLE_EXPLANATION = "Uses true observed raw weather from t+h through t+h+4 as an oracle upper bound, not a deployable forecast."
+FORMULA_DERIVED_FEATURE_COLUMNS = {
     "y1",
     "y2",
     "y2_y1",
@@ -134,8 +138,7 @@ ORACLE_DEFAULT_PREDICT_FEATURES = [
     "y4",
     "precipitation_t_gt_10",
     "t_gt_10",
-]
-ORACLE_EXPLANATION = "Uses true observed weather at t+h as an oracle upper bound, not a deployable forecast."
+}
 LOGREG_SOLVER_PENALTIES = {
     "lbfgs_l2": {"solver": "lbfgs", "penalty": "l2"},
     "liblinear_l1": {"solver": "liblinear", "penalty": "l1"},
@@ -288,7 +291,7 @@ def resolve_oracle_predict_features(
     available = set(available_columns)
     requested = list(predict_features or ORACLE_DEFAULT_PREDICT_FEATURES)
     normalized = list(dict.fromkeys(normalize_name(feature) for feature in requested))
-    allowed = set(FEATURE_COLUMNS) - {"day"}
+    allowed = set(ORACLE_DEFAULT_PREDICT_FEATURES)
     forbidden = [
         feature
         for feature in normalized
@@ -309,8 +312,8 @@ def resolve_oracle_predict_features(
     return normalized
 
 
-def oracle_column_name(feature: str, horizon: int) -> str:
-    return f"oracle_{feature}_h{int(horizon)}"
+def oracle_window_column_name(feature: str, horizon: int, offset: int) -> str:
+    return f"oracle_{feature}_h{int(horizon)}_plus{int(offset)}"
 
 
 def add_oracle_features(
@@ -324,10 +327,29 @@ def add_oracle_features(
     oracle_cols: list[str] = []
     grouped = work.groupby("year", sort=False)
     for feature in predict_features:
-        column = oracle_column_name(feature, horizon)
-        work[column] = grouped[feature].shift(-horizon)
-        oracle_cols.append(column)
+        for offset in ORACLE_RAW_WINDOW_OFFSETS:
+            column = oracle_window_column_name(feature, horizon, offset)
+            work[column] = grouped[feature].shift(-(horizon + offset))
+            oracle_cols.append(column)
     return work, oracle_cols
+
+
+def is_formula_derived_feature(column: str) -> bool:
+    if column in FORMULA_DERIVED_FEATURE_COLUMNS or column == "fe_y4_cloud_interaction":
+        return True
+    for source in FORMULA_DERIVED_FEATURE_COLUMNS:
+        prefixes = (
+            f"{source}_lag_",
+            f"{source}_roll_",
+            f"{source}_trend_",
+        )
+        if column.startswith(prefixes):
+            return True
+    return False
+
+
+def filter_oracle_safe_feature_columns(feature_cols: list[str]) -> list[str]:
+    return [column for column in feature_cols if not is_formula_derived_feature(column)]
 
 
 def fill_weather_missing(
@@ -449,6 +471,7 @@ def prepare_feature_splits(
     val_frame, _ = add_variant_features(val_filled, window_size, variant)
     test_frame, _ = add_variant_features(test_filled, window_size, variant)
     if oracle:
+        feature_cols = filter_oracle_safe_feature_columns(feature_cols)
         oracle_predict_features = list(predict_features or ORACLE_DEFAULT_PREDICT_FEATURES)
         train_frame, oracle_cols = add_oracle_features(train_frame, horizon, oracle_predict_features)
         val_frame, _ = add_oracle_features(val_frame, horizon, oracle_predict_features)
@@ -1185,6 +1208,9 @@ def run_one(
         })
     metrics = [metrics_row]
     write_csv(result_dir / "metrics.csv", metrics)
+    config_fill_values = fill_values
+    if args.oracle:
+        config_fill_values = {key: value for key, value in fill_values.items() if key in feature_cols}
     if selected_threshold is not None:
         threshold_payload = {
             "model": model,
@@ -1230,7 +1256,7 @@ def run_one(
                 "feature_count": len(feature_cols),
                 "feature_columns": feature_cols,
                 "imputation": "notebook: train median fallback, validation/test reuse train fill values, year-wise forward fill only",
-                "fill_values": fill_values,
+                "fill_values": config_fill_values,
                 "tomek_note": tomek_note or "",
                 "best_params": best_params,
                 "threshold": selected_threshold,
@@ -1338,7 +1364,8 @@ def main() -> int:
     if args.oracle:
         args.predict_features = resolve_oracle_predict_features(args.predict_features, df.columns)
         print(
-            "WARNING: --oracle uses true observed future weather at t+h as an upper-bound experiment. "
+            "WARNING: --oracle uses true observed raw future weather from t+h through t+h+4 "
+            "as an upper-bound experiment. "
             "Do not report it as a deployable model."
         )
     elif args.predict_features is None:

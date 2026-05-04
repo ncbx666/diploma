@@ -120,6 +120,22 @@ TEMPORAL_SOURCE_COLUMNS = [
 TEMPORAL_LAG_STEPS = [2, 7]
 TEMPORAL_ROLLING_WINDOWS = [3]
 TEMPORAL_ROLLING_STATS = ["mean", "std", "min", "max"]
+ORACLE_DEFAULT_PREDICT_FEATURES = [
+    "t_min",
+    "t_max",
+    "t_avg",
+    "precipitation",
+    "is_rain",
+    "cloudiness",
+    "y1",
+    "y2",
+    "y2_y1",
+    "y3",
+    "y4",
+    "precipitation_t_gt_10",
+    "t_gt_10",
+]
+ORACLE_EXPLANATION = "Uses true observed weather at t+h as an oracle upper bound, not a deployable forecast."
 LOGREG_SOLVER_PENALTIES = {
     "lbfgs_l2": {"solver": "lbfgs", "penalty": "l2"},
     "liblinear_l1": {"solver": "liblinear", "penalty": "l1"},
@@ -161,6 +177,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Output root directory.")
     parser.add_argument("--upload-dataset", action="store_true", help="Upload zips to a Kaggle Dataset after each experiment.")
     parser.add_argument("--dataset-slug", default=None, help="Kaggle Dataset slug, e.g. username/dataset-name.")
+    parser.add_argument("--oracle", action="store_true", help="Use true observed weather at t+h as oracle future features.")
+    parser.add_argument(
+        "--predict_features",
+        nargs="*",
+        default=None,
+        help="Weather columns to expose as oracle future features when --oracle is enabled.",
+    )
     return parser.parse_args()
 
 
@@ -256,6 +279,55 @@ def split_years(df: pd.DataFrame) -> tuple[list[int], list[int], list[int]]:
     val_years = years[-(VAL_YEAR_COUNT + TEST_YEAR_COUNT) : -TEST_YEAR_COUNT]
     test_years = years[-TEST_YEAR_COUNT:]
     return train_years, val_years, test_years
+
+
+def resolve_oracle_predict_features(
+    predict_features: Iterable[str] | None,
+    available_columns: Iterable[str],
+) -> list[str]:
+    available = set(available_columns)
+    requested = list(predict_features or ORACLE_DEFAULT_PREDICT_FEATURES)
+    normalized = list(dict.fromkeys(normalize_name(feature) for feature in requested))
+    allowed = set(FEATURE_COLUMNS) - {"day"}
+    forbidden = [
+        feature
+        for feature in normalized
+        if feature == "year"
+        or feature == "day"
+        or feature == "target_favorable"
+        or feature.startswith("target_h")
+        or feature not in allowed
+    ]
+    if forbidden:
+        raise ValueError(
+            "Oracle predict_features must be observed weather predictors only; "
+            f"invalid columns: {forbidden}"
+        )
+    missing = [feature for feature in normalized if feature not in available]
+    if missing:
+        raise ValueError(f"Oracle predict_features are missing from the dataset: {missing}")
+    return normalized
+
+
+def oracle_column_name(feature: str, horizon: int) -> str:
+    return f"oracle_{feature}_h{int(horizon)}"
+
+
+def add_oracle_features(
+    df: pd.DataFrame,
+    horizon: int,
+    predict_features: Iterable[str],
+) -> tuple[pd.DataFrame, list[str]]:
+    if horizon < 0:
+        raise ValueError("Oracle horizon must be non-negative.")
+    work = df.copy().sort_values(["year", "day"]).reset_index(drop=True)
+    oracle_cols: list[str] = []
+    grouped = work.groupby("year", sort=False)
+    for feature in predict_features:
+        column = oracle_column_name(feature, horizon)
+        work[column] = grouped[feature].shift(-horizon)
+        oracle_cols.append(column)
+    return work, oracle_cols
 
 
 def fill_weather_missing(
@@ -356,11 +428,14 @@ def prepare_features(df: pd.DataFrame, target_col: str, window_size: int, varian
 def prepare_feature_splits(
     df: pd.DataFrame,
     target_col: str,
+    horizon: int,
     window_size: int,
     variant: str,
     train_years: list[int],
     val_years: list[int],
     test_years: list[int],
+    oracle: bool = False,
+    predict_features: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str], dict[str, float]]:
     train_raw = df[df["year"].isin(train_years)].copy()
     val_raw = df[df["year"].isin(val_years)].copy()
@@ -373,6 +448,12 @@ def prepare_feature_splits(
     train_frame, feature_cols = add_variant_features(train_filled, window_size, variant)
     val_frame, _ = add_variant_features(val_filled, window_size, variant)
     test_frame, _ = add_variant_features(test_filled, window_size, variant)
+    if oracle:
+        oracle_predict_features = list(predict_features or ORACLE_DEFAULT_PREDICT_FEATURES)
+        train_frame, oracle_cols = add_oracle_features(train_frame, horizon, oracle_predict_features)
+        val_frame, _ = add_oracle_features(val_frame, horizon, oracle_predict_features)
+        test_frame, _ = add_oracle_features(test_frame, horizon, oracle_predict_features)
+        feature_cols = list(dict.fromkeys(feature_cols + oracle_cols))
 
     return (
         finalize_prepared_split(train_frame, feature_cols, target_col),
@@ -723,6 +804,14 @@ def write_config(path: Path, config: dict[str, Any]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def run_config_args(args: argparse.Namespace) -> dict[str, Any]:
+    config = dict(vars(args))
+    if not args.oracle:
+        config.pop("oracle", None)
+        config.pop("predict_features", None)
+    return config
+
+
 def write_placeholder_png(path: Path) -> None:
     """Write a tiny valid PNG when matplotlib is unavailable.
 
@@ -781,9 +870,11 @@ def write_confusion_png(path: Path, y_true: np.ndarray, y_pred: np.ndarray) -> N
     path.write_bytes(png)
 
 
-def safe_folder_name(output_root: Path, model: str, f1_value: float, variant: str | None = None) -> Path:
+def safe_folder_name(output_root: Path, model: str, f1_value: float, variant: str | None = None, oracle: bool = False) -> Path:
     score = int(round(max(0.0, min(1.0, f1_value)) * 100))
     prefix = f"{model}_{variant}" if variant else model
+    if oracle:
+        prefix = f"{prefix}_oracle"
     base = output_root / f"{prefix}_{score:02d}"
     if not base.exists():
         return base
@@ -918,18 +1009,22 @@ def run_one(
     train_df, val_df, test_df, feature_cols, fill_values = prepare_feature_splits(
         df,
         target_col,
+        horizon,
         window_size,
         variant,
         train_years,
         val_years,
         test_years,
+        oracle=args.oracle,
+        predict_features=args.predict_features,
     )
+    oracle_feature_cols = [col for col in feature_cols if col.startswith("oracle_")]
     if train_df.empty or test_df.empty:
         print(f"SKIP {model} variant={variant} h{horizon} w{window_size}: empty train/test split")
         return None
 
     if model in {"gru", "tft"}:
-        result_dir = safe_folder_name(args.output_dir, model, 0.0, variant)
+        result_dir = safe_folder_name(args.output_dir, model, 0.0, variant, oracle=args.oracle)
         result_dir.mkdir(parents=True, exist_ok=True)
         reason = (
             "gru skipped: GRU training requires the PyTorch sequence-model path from the notebook; "
@@ -939,7 +1034,28 @@ def run_one(
             "no artificial fallback was created."
         )
         (result_dir / "skipped_model.txt").write_text(reason + "\n", encoding="utf-8")
-        write_config(result_dir / "config_used.yaml", vars(args) | {"model": model, "variant": variant, "horizon": horizon, "window_size": window_size})
+        write_config(
+            result_dir / "config_used.yaml",
+            (
+                run_config_args(args)
+                | {
+                    "model": model,
+                    "variant": variant,
+                    "horizon": horizon,
+                    "window_size": window_size,
+                }
+            )
+            | (
+                {
+                    "oracle": True,
+                    "oracle_horizon": horizon,
+                    "explanation": ORACLE_EXPLANATION,
+                    "oracle_feature_columns": oracle_feature_cols,
+                }
+                if args.oracle
+                else {}
+            ),
+        )
         zip_path = zip_result(result_dir, args.output_dir)
         maybe_upload(zip_path, args.output_dir, args.upload_dataset, args.dataset_slug)
         return ExperimentResult(model, variant, horizon, window_size, 0.0, 0.0, 0.0, float("nan"), float("nan"), result_dir, zip_path)
@@ -1034,10 +1150,10 @@ def run_one(
         f1,
         roc_auc,
     )
-    result_dir = safe_folder_name(args.output_dir, model, f1, variant)
+    result_dir = safe_folder_name(args.output_dir, model, f1, variant, oracle=args.oracle)
     result_dir.mkdir(parents=True, exist_ok=True)
 
-    metrics = [{
+    metrics_row = {
         "model": model,
         "variant": variant,
         "variant_description": FEATURE_VARIANT_DESCRIPTIONS[variant],
@@ -1060,7 +1176,14 @@ def run_one(
         "feature_count": len(feature_cols),
         "tomek_note": tomek_note or "",
         "best_params": json.dumps(best_params, ensure_ascii=False),
-    }]
+    }
+    if args.oracle:
+        metrics_row.update({
+            "oracle": True,
+            "oracle_horizon": horizon,
+            "oracle_feature_count": len(oracle_feature_cols),
+        })
+    metrics = [metrics_row]
     write_csv(result_dir / "metrics.csv", metrics)
     if selected_threshold is not None:
         threshold_payload = {
@@ -1096,29 +1219,57 @@ def run_one(
         write_placeholder_png(result_dir / "classification_report.png")
     write_config(
         result_dir / "config_used.yaml",
-        vars(args)
-        | {
-            "model": model,
-            "variant": variant,
-            "variant_description": FEATURE_VARIANT_DESCRIPTIONS[variant],
-            "horizon": horizon,
-            "window_size": window_size,
-            "feature_count": len(feature_cols),
-            "feature_columns": feature_cols,
-            "imputation": "notebook: train median fallback, validation/test reuse train fill values, year-wise forward fill only",
-            "fill_values": fill_values,
-            "tomek_note": tomek_note or "",
-            "best_params": best_params,
-            "threshold": selected_threshold,
-            "threshold_objective": threshold_info.get("objective"),
-            "roc_auc": roc_auc,
-            "pr_auc": pr_auc,
-            "precision_floor_met": bool(precision_floor_met),
-            "rank_rule": "precision>=0.60 -> recall -> pr_auc -> f1 -> roc_auc",
-            "rank_key": [precision_floor_met, rank_recall, rank_pr_auc, rank_f1, rank_roc_auc],
-            **val_metric_values,
-        },
+        (
+            run_config_args(args)
+            | {
+                "model": model,
+                "variant": variant,
+                "variant_description": FEATURE_VARIANT_DESCRIPTIONS[variant],
+                "horizon": horizon,
+                "window_size": window_size,
+                "feature_count": len(feature_cols),
+                "feature_columns": feature_cols,
+                "imputation": "notebook: train median fallback, validation/test reuse train fill values, year-wise forward fill only",
+                "fill_values": fill_values,
+                "tomek_note": tomek_note or "",
+                "best_params": best_params,
+                "threshold": selected_threshold,
+                "threshold_objective": threshold_info.get("objective"),
+                "roc_auc": roc_auc,
+                "pr_auc": pr_auc,
+                "precision_floor_met": bool(precision_floor_met),
+                "rank_rule": "precision>=0.60 -> recall -> pr_auc -> f1 -> roc_auc",
+                "rank_key": [precision_floor_met, rank_recall, rank_pr_auc, rank_f1, rank_roc_auc],
+                **val_metric_values,
+            }
+        )
+        | (
+            {
+                "oracle": True,
+                "predict_features": args.predict_features,
+                "oracle_horizon": horizon,
+                "explanation": ORACLE_EXPLANATION,
+                "oracle_feature_columns": oracle_feature_cols,
+            }
+            if args.oracle
+            else {}
+        ),
     )
+    if args.oracle:
+        (result_dir / "oracle_features.json").write_text(
+            json.dumps(
+                {
+                    "oracle": True,
+                    "oracle_horizon": horizon,
+                    "predict_features": args.predict_features,
+                    "oracle_feature_columns": oracle_feature_cols,
+                    "explanation": ORACLE_EXPLANATION,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     (result_dir / "train_val_test_years.json").write_text(
         json.dumps({"train": train_years, "validation": val_years, "test": test_years}, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -1126,7 +1277,8 @@ def run_one(
     save_plots(result_dir, np.asarray(y_test, dtype=int), np.asarray(y_pred, dtype=int), y_score, estimator, feature_cols)
     zip_path = zip_result(result_dir, args.output_dir)
     maybe_upload(zip_path, args.output_dir, args.upload_dataset, args.dataset_slug)
-    print(f"DONE {model} variant={variant} horizon={horizon} window={window_size} f1={f1:.3f} -> {result_dir} zip={zip_path}")
+    mode_label = " oracle" if args.oracle else ""
+    print(f"DONE{mode_label} {model} variant={variant} horizon={horizon} window={window_size} f1={f1:.3f} -> {result_dir} zip={zip_path}")
     return ExperimentResult(
         model,
         variant,
@@ -1183,6 +1335,14 @@ def main() -> int:
     models = choose_models(args.models)
     data_path = find_data_file(args.data)
     df = add_targets(load_dataset(data_path), args.horizons)
+    if args.oracle:
+        args.predict_features = resolve_oracle_predict_features(args.predict_features, df.columns)
+        print(
+            "WARNING: --oracle uses true observed future weather at t+h as an upper-bound experiment. "
+            "Do not report it as a deployable model."
+        )
+    elif args.predict_features is None:
+        args.predict_features = []
     train_years, val_years, test_years = split_years(df)
     print(f"Data: {data_path} rows={len(df)} years={df['year'].nunique()}")
     print(f"Train years: {train_years}")
@@ -1203,16 +1363,20 @@ def main() -> int:
     summary_rows = []
     for result in results:
         rank_key = result_rank_key(result)
-        summary_rows.append(
-            result.__dict__
-            | {
-                "output_dir": str(result.output_dir),
-                "zip_path": str(result.zip_path),
-                "precision_floor_met": bool(rank_key[0]),
-                "rank_rule": "precision>=0.60 -> recall -> pr_auc -> f1 -> roc_auc",
-                "rank_key": json.dumps(list(rank_key)),
-            }
-        )
+        summary_row = result.__dict__ | {
+            "output_dir": str(result.output_dir),
+            "zip_path": str(result.zip_path),
+            "precision_floor_met": bool(rank_key[0]),
+            "rank_rule": "precision>=0.60 -> recall -> pr_auc -> f1 -> roc_auc",
+            "rank_key": json.dumps(list(rank_key)),
+        }
+        if args.oracle:
+            summary_row.update({
+                "oracle": True,
+                "oracle_horizon": result.horizon,
+                "predict_features": json.dumps(args.predict_features, ensure_ascii=False),
+            })
+        summary_rows.append(summary_row)
     write_csv(args.output_dir / "summary.csv", summary_rows)
     return 0
 

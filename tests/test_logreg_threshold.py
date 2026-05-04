@@ -8,9 +8,13 @@ from src.evaluation import search_threshold, threshold_objective_value
 from src.models import build_model, fit_predict_sklearn
 from train import (
     ExperimentResult,
+    add_oracle_features,
+    add_variant_features,
     build_estimator,
     enforce_top_n,
+    finalize_prepared_split,
     fill_weather_missing,
+    resolve_oracle_predict_features,
     split_years,
     suggest_logreg_params,
 )
@@ -142,6 +146,104 @@ class LogregThresholdTests(unittest.TestCase):
 
         self.assertEqual(train.TEMPORAL_LAG_STEPS, [2, 7])
         self.assertEqual(train.TEMPORAL_ROLLING_WINDOWS, [3])
+
+    def test_oracle_features_shift_within_year_and_leave_tail_nan(self):
+        df = pd.DataFrame({
+            "year": [2000, 2000, 2000, 2001, 2001],
+            "day": [1, 2, 3, 1, 2],
+            "t_min": [10.0, 11.0, 12.0, 20.0, 21.0],
+            "target_favorable": [0, 1, 0, 1, 0],
+        })
+
+        shifted, oracle_cols = add_oracle_features(df, 1, ["t_min"])
+
+        self.assertEqual(oracle_cols, ["oracle_t_min_h1"])
+        self.assertEqual(shifted.loc[0, "oracle_t_min_h1"], 11.0)
+        self.assertEqual(shifted.loc[1, "oracle_t_min_h1"], 12.0)
+        self.assertTrue(np.isnan(shifted.loc[2, "oracle_t_min_h1"]))
+        self.assertEqual(shifted.loc[3, "oracle_t_min_h1"], 21.0)
+        self.assertTrue(np.isnan(shifted.loc[4, "oracle_t_min_h1"]))
+
+    def test_oracle_tail_rows_are_removed_by_existing_finalize_step(self):
+        df = pd.DataFrame({
+            "year": [2000, 2000, 2000],
+            "day": [1, 2, 3],
+            "target_h1": [1, 0, np.nan],
+            "t_min": [10.0, 11.0, 12.0],
+        })
+        shifted, oracle_cols = add_oracle_features(df, 1, ["t_min"])
+
+        finalized = finalize_prepared_split(shifted, ["t_min", *oracle_cols], "target_h1")
+
+        self.assertEqual(finalized["day"].tolist(), [1, 2])
+        self.assertEqual(finalized["oracle_t_min_h1"].tolist(), [11.0, 12.0])
+
+    def test_oracle_predict_features_reject_targets_and_non_weather_columns(self):
+        columns = ["year", "day", "t_min", "target_favorable", "target_h2"]
+
+        with self.assertRaises(ValueError):
+            resolve_oracle_predict_features(["target_favorable"], columns)
+        with self.assertRaises(ValueError):
+            resolve_oracle_predict_features(["target_h2"], columns)
+        with self.assertRaises(ValueError):
+            resolve_oracle_predict_features(["year"], columns)
+        with self.assertRaises(ValueError):
+            resolve_oracle_predict_features(["day"], columns)
+
+    def test_oracle_predict_features_use_default_weather_list(self):
+        columns = [
+            "year",
+            "day",
+            "target_favorable",
+            "target_h2",
+            "t_min",
+            "t_max",
+            "t_avg",
+            "precipitation",
+            "is_rain",
+            "cloudiness",
+            "y1",
+            "y2",
+            "y2_y1",
+            "y3",
+            "y4",
+            "precipitation_t_gt_10",
+            "t_gt_10",
+        ]
+
+        features = resolve_oracle_predict_features(None, columns)
+
+        self.assertIn("t_min", features)
+        self.assertIn("t_gt_10", features)
+        self.assertNotIn("target_favorable", features)
+        self.assertNotIn("target_h2", features)
+        self.assertNotIn("year", features)
+        self.assertNotIn("day", features)
+
+    def test_normal_variant_features_do_not_include_oracle_columns(self):
+        df = pd.DataFrame({
+            "year": [2000, 2000, 2000],
+            "day": [1, 2, 3],
+            "t_min": [10.0, 11.0, 12.0],
+            "t_max": [20.0, 21.0, 22.0],
+            "is_rain": [0, 1, 0],
+            "target_favorable": [0, 1, 0],
+            "y2": [1.0, 1.0, 1.0],
+            "y1": [1.0, 1.0, 1.0],
+            "y2_y1": [0.0, 0.0, 0.0],
+            "precipitation": [0.0, 1.0, 0.0],
+            "t_avg": [15.0, 16.0, 17.0],
+            "cloudiness": [3.0, 4.0, 5.0],
+            "y3": [0.0, 0.0, 0.0],
+            "y4": [0.0, 0.0, 0.0],
+            "precipitation_t_gt_10": [0.0, 1.0, 0.0],
+            "t_gt_10": [15.0, 16.0, 17.0],
+        })
+
+        frame, feature_cols = add_variant_features(df, 7, "baseline")
+
+        self.assertFalse(any(col.startswith("oracle_") for col in frame.columns))
+        self.assertFalse(any(col.startswith("oracle_") for col in feature_cols))
 
     def test_top_n_uses_notebook_rank_before_f1(self):
         low_precision_high_f1 = ExperimentResult(

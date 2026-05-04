@@ -137,6 +137,12 @@ class LogregThresholdTests(unittest.TestCase):
         self.assertEqual(train_filled.loc[0, "is_rain"], 0.0)
         self.assertEqual(val_filled.loc[0, "is_rain"], 0.0)
 
+    def test_temporal_feature_set_matches_best_logreg_notebook(self):
+        import train
+
+        self.assertEqual(train.TEMPORAL_LAG_STEPS, [2, 7])
+        self.assertEqual(train.TEMPORAL_ROLLING_WINDOWS, [3])
+
     def test_top_n_uses_notebook_rank_before_f1(self):
         low_precision_high_f1 = ExperimentResult(
             "logreg", "baseline", 2, 7, 0.95, 0.50, 0.95, 0.99, 0.99, Path("missing-a"), Path("missing-a.zip")

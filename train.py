@@ -117,8 +117,8 @@ TEMPORAL_SOURCE_COLUMNS = [
     "precipitation_t_gt_10",
     "t_gt_10",
 ]
-TEMPORAL_LAG_STEPS = [1, 2, 3, 7]
-TEMPORAL_ROLLING_WINDOWS = [3, 7]
+TEMPORAL_LAG_STEPS = [2, 7]
+TEMPORAL_ROLLING_WINDOWS = [3]
 TEMPORAL_ROLLING_STATS = ["mean", "std", "min", "max"]
 LOGREG_SOLVER_PENALTIES = {
     "lbfgs_l2": {"solver": "lbfgs", "penalty": "l2"},

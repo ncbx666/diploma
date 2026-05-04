@@ -13,6 +13,7 @@ from train import (
     build_estimator,
     enforce_top_n,
     finalize_prepared_split,
+    filter_oracle_safe_feature_columns,
     fill_weather_missing,
     resolve_oracle_predict_features,
     split_years,
@@ -147,39 +148,46 @@ class LogregThresholdTests(unittest.TestCase):
         self.assertEqual(train.TEMPORAL_LAG_STEPS, [2, 7])
         self.assertEqual(train.TEMPORAL_ROLLING_WINDOWS, [3])
 
-    def test_oracle_features_shift_within_year_and_leave_tail_nan(self):
+    def test_oracle_features_add_raw_future_window_within_year(self):
         df = pd.DataFrame({
-            "year": [2000, 2000, 2000, 2001, 2001],
-            "day": [1, 2, 3, 1, 2],
-            "t_min": [10.0, 11.0, 12.0, 20.0, 21.0],
-            "target_favorable": [0, 1, 0, 1, 0],
+            "year": [2000, 2000, 2000, 2000, 2000, 2000, 2001, 2001],
+            "day": [1, 2, 3, 4, 5, 6, 1, 2],
+            "t_min": [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 20.0, 21.0],
+            "target_favorable": [0, 1, 0, 1, 0, 1, 1, 0],
         })
 
         shifted, oracle_cols = add_oracle_features(df, 1, ["t_min"])
 
-        self.assertEqual(oracle_cols, ["oracle_t_min_h1"])
-        self.assertEqual(shifted.loc[0, "oracle_t_min_h1"], 11.0)
-        self.assertEqual(shifted.loc[1, "oracle_t_min_h1"], 12.0)
-        self.assertTrue(np.isnan(shifted.loc[2, "oracle_t_min_h1"]))
-        self.assertEqual(shifted.loc[3, "oracle_t_min_h1"], 21.0)
-        self.assertTrue(np.isnan(shifted.loc[4, "oracle_t_min_h1"]))
+        self.assertEqual(oracle_cols, [
+            "oracle_t_min_h1_plus0",
+            "oracle_t_min_h1_plus1",
+            "oracle_t_min_h1_plus2",
+            "oracle_t_min_h1_plus3",
+            "oracle_t_min_h1_plus4",
+        ])
+        self.assertEqual(shifted.loc[0, "oracle_t_min_h1_plus0"], 11.0)
+        self.assertEqual(shifted.loc[0, "oracle_t_min_h1_plus4"], 15.0)
+        self.assertTrue(np.isnan(shifted.loc[1, "oracle_t_min_h1_plus4"]))
+        self.assertEqual(shifted.loc[6, "oracle_t_min_h1_plus0"], 21.0)
+        self.assertTrue(np.isnan(shifted.loc[6, "oracle_t_min_h1_plus1"]))
 
     def test_oracle_tail_rows_are_removed_by_existing_finalize_step(self):
         df = pd.DataFrame({
-            "year": [2000, 2000, 2000],
-            "day": [1, 2, 3],
-            "target_h1": [1, 0, np.nan],
-            "t_min": [10.0, 11.0, 12.0],
+            "year": [2000, 2000, 2000, 2000, 2000, 2000],
+            "day": [1, 2, 3, 4, 5, 6],
+            "target_h1": [1, 0, 1, 0, 1, np.nan],
+            "t_min": [10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
         })
         shifted, oracle_cols = add_oracle_features(df, 1, ["t_min"])
 
         finalized = finalize_prepared_split(shifted, ["t_min", *oracle_cols], "target_h1")
 
-        self.assertEqual(finalized["day"].tolist(), [1, 2])
-        self.assertEqual(finalized["oracle_t_min_h1"].tolist(), [11.0, 12.0])
+        self.assertEqual(finalized["day"].tolist(), [1])
+        self.assertEqual(finalized["oracle_t_min_h1_plus0"].tolist(), [11.0])
+        self.assertEqual(finalized["oracle_t_min_h1_plus4"].tolist(), [15.0])
 
     def test_oracle_predict_features_reject_targets_and_non_weather_columns(self):
-        columns = ["year", "day", "t_min", "target_favorable", "target_h2"]
+        columns = ["year", "day", "t_min", "target_favorable", "target_h2", "y1"]
 
         with self.assertRaises(ValueError):
             resolve_oracle_predict_features(["target_favorable"], columns)
@@ -189,6 +197,8 @@ class LogregThresholdTests(unittest.TestCase):
             resolve_oracle_predict_features(["year"], columns)
         with self.assertRaises(ValueError):
             resolve_oracle_predict_features(["day"], columns)
+        with self.assertRaises(ValueError):
+            resolve_oracle_predict_features(["y1"], columns)
 
     def test_oracle_predict_features_use_default_weather_list(self):
         columns = [
@@ -214,11 +224,40 @@ class LogregThresholdTests(unittest.TestCase):
         features = resolve_oracle_predict_features(None, columns)
 
         self.assertIn("t_min", features)
-        self.assertIn("t_gt_10", features)
+        self.assertIn("cloudiness", features)
         self.assertNotIn("target_favorable", features)
         self.assertNotIn("target_h2", features)
         self.assertNotIn("year", features)
         self.assertNotIn("day", features)
+        self.assertNotIn("y1", features)
+        self.assertNotIn("y2", features)
+        self.assertNotIn("y2_y1", features)
+        self.assertNotIn("y3", features)
+        self.assertNotIn("y4", features)
+        self.assertNotIn("t_gt_10", features)
+
+    def test_oracle_safe_feature_filter_removes_formula_derived_columns(self):
+        feature_cols = [
+            "day",
+            "t_min",
+            "cloudiness",
+            "y1",
+            "y2",
+            "y2_y1",
+            "y3",
+            "y4",
+            "precipitation_t_gt_10",
+            "t_gt_10",
+            "y1_lag_2",
+            "y2_roll_3_mean",
+            "y4_trend_3_vs_prev3",
+            "fe_y4_cloud_interaction",
+            "fe_cold_rain_index",
+        ]
+
+        filtered = filter_oracle_safe_feature_columns(feature_cols)
+
+        self.assertEqual(filtered, ["day", "t_min", "cloudiness", "fe_cold_rain_index"])
 
     def test_normal_variant_features_do_not_include_oracle_columns(self):
         df = pd.DataFrame({

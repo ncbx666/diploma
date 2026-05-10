@@ -1,5 +1,66 @@
 # Potato illness forecasting on Kaggle
 
+## Weather-only forecasting benchmark
+
+Use `train_weather.py` when you want a pure weather benchmark. It forecasts raw
+weather variables only:
+
+- `lead_1 = t+1`
+- `lead_2 = t+2`
+- targets: `t_min`, `t_max`, `t_avg`, `precipitation`, `is_rain`, `cloudiness`
+
+It does not train disease classifiers, does not predict `Target_Favorable`, and
+does not use disease-derived or formula-derived columns such as `y1`, `y2`,
+`y2_y1`, `y3`, `y4`, `precipitation_t_gt_10`, or `t_gt_10`.
+
+Install dependencies on Kaggle:
+
+```bash
+pip install -r requirements.txt
+```
+
+Fast smoke run:
+
+```bash
+python train_weather.py \
+  --data Golitcino72-17d2_CLEAN.xlsx \
+  --models catboost_hybrid lightgbm_hybrid \
+  --window-sizes 7 \
+  --tune-trials 0 \
+  --output-dir /kaggle/working/weather_outputs
+```
+
+Full weather benchmark:
+
+```bash
+python train_weather.py \
+  --data Golitcino72-17d2_CLEAN.xlsx \
+  --models catboost_hybrid lightgbm_hybrid chronos2 \
+  --window-sizes 7 11 \
+  --tune-trials 20 \
+  --output-dir /kaggle/working/weather_outputs
+```
+
+`catboost_hybrid` and `lightgbm_hybrid` train direct one-head-per-variable
+forecasters and blend them with a raw-weather persistence baseline using the
+validation split. `chronos2` uses Chronos-2 zero-shot inference from
+`chronos-forecasting>=2.0`; on Kaggle GPU runtimes it will download
+`amazon/chronos-2` from Hugging Face the first time it runs.
+
+Outputs are written under `/kaggle/working/weather_outputs` by default:
+
+- `summary_weather.csv` ranks model/window runs by weather-only metrics.
+- `metrics_weather_all.csv` contains per-lead, per-variable metrics.
+- each run folder contains `predictions.csv`, `metrics_weather.csv`,
+  `summary_weather.json`, `config_used.json`, and a zip under `zips/`.
+
+Regression weather targets are compared with MAE, RMSE, sMAPE, and R2.
+`is_rain` is compared with accuracy, F1, precision, recall, ROC AUC, and Brier
+score. The aggregate `weather_score_lower_is_better` is weather-only and combines
+sMAPE, Brier loss, and rain F1.
+
+---
+
 This project turns the reference notebooks into a small Kaggle-friendly training
 script. The original notebooks are kept in the repository as references; the main
 entry point is `train.py`.

@@ -16,3 +16,6 @@ kaggle
 torch
 pytorch-lightning
 pytorch-forecasting
+chronos-forecasting>=2.0
+pyarrow
+accelerate

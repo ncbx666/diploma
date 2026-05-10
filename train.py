@@ -451,7 +451,7 @@ def add_variant_features(df: pd.DataFrame, window_size: int, variant: str, no_y:
 
 
 def finalize_prepared_split(frame: pd.DataFrame, feature_cols: list[str], target_col: str) -> pd.DataFrame:
-    cols = ["year", "day", target_col] + feature_cols
+    cols = list(dict.fromkeys(["year", "day", target_col] + feature_cols))
     subset = frame[cols].dropna().reset_index(drop=True)
     subset[target_col] = subset[target_col].round().clip(0, 1).astype(int)
     return subset
@@ -911,6 +911,19 @@ def write_confusion_png(path: Path, y_true: np.ndarray, y_pred: np.ndarray) -> N
     path.write_bytes(png)
 
 
+def top_feature_importances(
+    importances: Iterable[float],
+    feature_cols: list[str],
+    limit: int = 20,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    values = np.asarray(importances, dtype=float).reshape(-1)
+    labels = np.asarray(feature_cols)
+    if values.size == 0 or values.size != labels.size:
+        return None
+    order = np.argsort(values)[-min(limit, values.size) :]
+    return labels[order], values[order]
+
+
 def safe_folder_name(output_root: Path, model: str, f1_value: float, variant: str | None = None, oracle: bool = False) -> Path:
     score = int(round(max(0.0, min(1.0, f1_value)) * 100))
     prefix = f"{model}_{variant}" if variant else model
@@ -976,13 +989,20 @@ def save_plots(result_dir: Path, y_true: np.ndarray, y_pred: np.ndarray, y_score
         if importances is None:
             skipped.append("feature_importance.png: model does not naturally expose feature_importances_")
         else:
-            order = np.argsort(importances)[-20:]
-            fig, ax = plt.subplots(figsize=(8, 6))
-            ax.barh(np.asarray(feature_cols)[order], np.asarray(importances)[order])
-            ax.set_title("Feature importance")
-            fig.tight_layout()
-            fig.savefig(result_dir / "feature_importance.png")
-            plt.close(fig)
+            plot_data = top_feature_importances(importances, feature_cols)
+            if plot_data is None:
+                skipped.append(
+                    "feature_importance.png: feature_importances_ length "
+                    f"{np.asarray(importances).size} does not match feature column count {len(feature_cols)}"
+                )
+            else:
+                labels, values = plot_data
+                fig, ax = plt.subplots(figsize=(8, 6))
+                ax.barh(labels, values)
+                ax.set_title("Feature importance")
+                fig.tight_layout()
+                fig.savefig(result_dir / "feature_importance.png")
+                plt.close(fig)
     if skipped:
         (result_dir / "skipped_plots.txt").write_text("\n".join(skipped) + "\n", encoding="utf-8")
 

@@ -180,6 +180,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Output root directory.")
     parser.add_argument("--upload-dataset", action="store_true", help="Upload zips to a Kaggle Dataset after each experiment.")
     parser.add_argument("--dataset-slug", default=None, help="Kaggle Dataset slug, e.g. username/dataset-name.")
+    parser.add_argument("--no-y", action="store_true", help="Exclude y1/y2/y3/y4 and their derived features.")
     parser.add_argument("--oracle", action="store_true", help="Use true observed weather at t+h as oracle future features.")
     parser.add_argument(
         "--predict_features",
@@ -348,6 +349,19 @@ def is_formula_derived_feature(column: str) -> bool:
     return False
 
 
+def is_y_feature(column: str) -> bool:
+    if column in {"y1", "y2", "y2_y1", "y3", "y4", "fe_y4_cloud_interaction"}:
+        return True
+    for source in ("y1", "y2", "y2_y1", "y3", "y4"):
+        if column.startswith((f"{source}_lag_", f"{source}_roll_", f"{source}_trend_")):
+            return True
+    return False
+
+
+def filter_y_feature_columns(feature_cols: list[str]) -> list[str]:
+    return [column for column in feature_cols if not is_y_feature(column)]
+
+
 def filter_oracle_safe_feature_columns(feature_cols: list[str]) -> list[str]:
     return [column for column in feature_cols if not is_formula_derived_feature(column)]
 
@@ -382,14 +396,15 @@ def fill_weather_missing(
     return work, fill_values
 
 
-def add_variant_features(df: pd.DataFrame, window_size: int, variant: str) -> tuple[pd.DataFrame, list[str]]:
+def add_variant_features(df: pd.DataFrame, window_size: int, variant: str, no_y: bool = False) -> tuple[pd.DataFrame, list[str]]:
     if variant not in FEATURE_VARIANTS:
         raise ValueError(f"Unknown feature variant: {variant}")
     work = df.copy().sort_values(["year", "day"]).reset_index(drop=True)
     feature_cols = FEATURE_COLUMNS.copy()
 
     if "interaction" in variant:
-        work["fe_y4_cloud_interaction"] = work["y4"] * work["cloudiness"]
+        if not no_y:
+            work["fe_y4_cloud_interaction"] = work["y4"] * work["cloudiness"]
         work["fe_cold_rain_index"] = work["is_rain"] * (35 - work["t_avg"])
         feature_cols.extend(INTERACTION_FEATURE_COLUMNS)
 
@@ -430,6 +445,8 @@ def add_variant_features(df: pd.DataFrame, window_size: int, variant: str) -> tu
             feature_cols.append(trend_col)
 
     feature_cols = list(dict.fromkeys(feature_cols))
+    if no_y:
+        feature_cols = filter_y_feature_columns(feature_cols)
     return work, feature_cols
 
 
@@ -440,10 +457,10 @@ def finalize_prepared_split(frame: pd.DataFrame, feature_cols: list[str], target
     return subset
 
 
-def prepare_features(df: pd.DataFrame, target_col: str, window_size: int, variant: str) -> tuple[pd.DataFrame, list[str]]:
+def prepare_features(df: pd.DataFrame, target_col: str, window_size: int, variant: str, no_y: bool = False) -> tuple[pd.DataFrame, list[str]]:
     """Backward-compatible single-frame feature preparation."""
     filled, _ = fill_weather_missing(df)
-    work, feature_cols = add_variant_features(filled, window_size, variant)
+    work, feature_cols = add_variant_features(filled, window_size, variant, no_y=no_y)
     return finalize_prepared_split(work, feature_cols, target_col), feature_cols
 
 
@@ -458,6 +475,7 @@ def prepare_feature_splits(
     test_years: list[int],
     oracle: bool = False,
     predict_features: list[str] | None = None,
+    no_y: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str], dict[str, float]]:
     train_raw = df[df["year"].isin(train_years)].copy()
     val_raw = df[df["year"].isin(val_years)].copy()
@@ -467,9 +485,9 @@ def prepare_feature_splits(
     val_filled, _ = fill_weather_missing(val_raw, fill_values)
     test_filled, _ = fill_weather_missing(test_raw, fill_values)
 
-    train_frame, feature_cols = add_variant_features(train_filled, window_size, variant)
-    val_frame, _ = add_variant_features(val_filled, window_size, variant)
-    test_frame, _ = add_variant_features(test_filled, window_size, variant)
+    train_frame, feature_cols = add_variant_features(train_filled, window_size, variant, no_y=no_y)
+    val_frame, _ = add_variant_features(val_filled, window_size, variant, no_y=no_y)
+    test_frame, _ = add_variant_features(test_filled, window_size, variant, no_y=no_y)
     if oracle:
         feature_cols = filter_oracle_safe_feature_columns(feature_cols)
         oracle_predict_features = list(predict_features or ORACLE_DEFAULT_PREDICT_FEATURES)
@@ -1040,6 +1058,7 @@ def run_one(
         test_years,
         oracle=args.oracle,
         predict_features=args.predict_features,
+        no_y=args.no_y,
     )
     oracle_feature_cols = [col for col in feature_cols if col.startswith("oracle_")]
     if train_df.empty or test_df.empty:
@@ -1209,7 +1228,7 @@ def run_one(
     metrics = [metrics_row]
     write_csv(result_dir / "metrics.csv", metrics)
     config_fill_values = fill_values
-    if args.oracle:
+    if args.oracle or args.no_y:
         config_fill_values = {key: value for key, value in fill_values.items() if key in feature_cols}
     if selected_threshold is not None:
         threshold_payload = {

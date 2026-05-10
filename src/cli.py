@@ -16,6 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--upload-dataset", action="store_true")
     parser.add_argument("--dataset-slug", default=None)
+    parser.add_argument("--no-y", action="store_true", help="Exclude y1/y2/y3/y4 and their derived features")
     return parser
 
 
@@ -31,6 +32,7 @@ def main(argv: list[str] | None = None) -> int:
         tune_trials=args.tune_trials,
         upload_dataset=args.upload_dataset,
         dataset_slug=args.dataset_slug,
+        no_y=args.no_y,
     )
     for row in results:
         print(row)

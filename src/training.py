@@ -24,6 +24,7 @@ def run_experiments(
     tune_trials: int = 1,
     upload_dataset: bool = False,
     dataset_slug: str | None = None,
+    no_y: bool = False,
     random_state: int = 42,
 ) -> list[dict]:
     if upload_dataset and not dataset_slug:
@@ -40,7 +41,7 @@ def run_experiments(
 
     for horizon in horizons:
         target_col = f"target_h{horizon}"
-        feature_frame, features = add_engineered_features(data, window_sizes)
+        feature_frame, features = add_engineered_features(data, window_sizes, no_y=no_y)
         train_df = feature_frame[feature_frame["year"].isin(splits["train"])]
         val_df = feature_frame[feature_frame["year"].isin(splits["val"])]
         test_df = feature_frame[feature_frame["year"].isin(splits["test"])]
@@ -78,6 +79,7 @@ def run_experiments(
                 "window_sizes": window_sizes,
                 "top_n": top_n,
                 "tune_trials": tune_trials,
+                "no_y": no_y,
                 "primary_metric": "f1",
             }
             if model_name == "logreg":

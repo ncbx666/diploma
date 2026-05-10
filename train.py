@@ -181,6 +181,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--upload-dataset", action="store_true", help="Upload zips to a Kaggle Dataset after each experiment.")
     parser.add_argument("--dataset-slug", default=None, help="Kaggle Dataset slug, e.g. username/dataset-name.")
     parser.add_argument("--no-y", action="store_true", help="Exclude y1/y2/y3/y4 and their derived features.")
+    parser.add_argument("--invert-classes", action="store_true", help="Invert final binary predictions: 0 becomes 1 and 1 becomes 0.")
     parser.add_argument("--oracle", action="store_true", help="Use true observed weather at t+h as oracle future features.")
     parser.add_argument(
         "--predict_features",
@@ -661,6 +662,17 @@ def validation_metrics(y_true: pd.Series | np.ndarray, scores: np.ndarray, thres
         "val_f1": float(f1_score(y_true_arr, y_pred, zero_division=0)),
         "val_accuracy": float(accuracy_score(y_true_arr, y_pred)),
     }
+
+
+def invert_binary_outputs(
+    y_pred: Iterable[int],
+    y_score: Iterable[float] | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    inverted_pred = 1 - np.asarray(y_pred, dtype=int)
+    if y_score is None:
+        return inverted_pred, None
+    inverted_score = 1.0 - np.asarray(y_score, dtype=float)
+    return inverted_pred, inverted_score
 
 
 def safe_roc_auc(y_true: pd.Series | np.ndarray, scores: np.ndarray | None) -> float:
@@ -1198,6 +1210,9 @@ def run_one(
         estimator = None
     else:
         raise ValueError(model)
+
+    if args.invert_classes:
+        y_pred, y_score = invert_binary_outputs(y_pred, y_score)
 
     f1 = float(f1_score(y_test, y_pred, zero_division=0))
     precision = float(precision_score(y_test, y_pred, zero_division=0))

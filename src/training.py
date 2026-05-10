@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 
 from .artifacts import copy_zip_to_persistent, save_experiment_artifacts, upload_dataset_version
@@ -12,6 +13,13 @@ from .features import add_engineered_features, make_xy
 from .models import fit_predict_sklearn, predict_blitecast, predict_sarima
 
 DEFAULT_OUTPUT_DIR = "/kaggle/working/outputs"
+
+
+def invert_binary_outputs(y_pred: Iterable[int], y_score: Iterable[float] | None = None) -> tuple[np.ndarray, np.ndarray | None]:
+    inverted_pred = 1 - np.asarray(list(y_pred), dtype=int)
+    if y_score is None:
+        return inverted_pred, None
+    return inverted_pred, 1.0 - np.asarray(list(y_score), dtype=float)
 
 
 def run_experiments(
@@ -25,6 +33,7 @@ def run_experiments(
     upload_dataset: bool = False,
     dataset_slug: str | None = None,
     no_y: bool = False,
+    invert_classes: bool = False,
     random_state: int = 42,
 ) -> list[dict]:
     if upload_dataset and not dataset_slug:
@@ -66,12 +75,16 @@ def run_experiments(
                 fitted = predict_sarima(y_train, len(y_test))
             else:
                 raise ValueError(f"Unsupported model for this worker slice: {model_name}")
-            metrics, report = evaluate_binary(y_test, fitted.y_pred_binary)
+            y_pred_binary = fitted.y_pred_binary
+            y_score = fitted.y_score
+            if invert_classes:
+                y_pred_binary, y_score = invert_binary_outputs(y_pred_binary, y_score)
+            metrics, report = evaluate_binary(y_test, y_pred_binary)
             predictions = meta_test.reset_index(drop=True).copy()
             predictions["y_true"] = list(y_test)
-            predictions["y_pred_binary"] = fitted.y_pred_binary
-            if fitted.y_score is not None:
-                predictions["y_score"] = fitted.y_score
+            predictions["y_pred_binary"] = y_pred_binary
+            if y_score is not None:
+                predictions["y_score"] = y_score
             config = {
                 "excel_path": str(excel_path),
                 "model": model_name,
@@ -80,6 +93,7 @@ def run_experiments(
                 "top_n": top_n,
                 "tune_trials": tune_trials,
                 "no_y": no_y,
+                "invert_classes": invert_classes,
                 "primary_metric": "f1",
             }
             if model_name == "logreg":

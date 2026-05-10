@@ -17,6 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--upload-dataset", action="store_true")
     parser.add_argument("--dataset-slug", default=None)
     parser.add_argument("--no-y", action="store_true", help="Exclude y1/y2/y3/y4 and their derived features")
+    parser.add_argument("--invert-classes", action="store_true", help="Invert final binary predictions")
     return parser
 
 
@@ -33,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
         upload_dataset=args.upload_dataset,
         dataset_slug=args.dataset_slug,
         no_y=args.no_y,
+        invert_classes=args.invert_classes,
     )
     for row in results:
         print(row)

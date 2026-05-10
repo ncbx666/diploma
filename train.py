@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover - depends on runtime
     plt = None
 
 RANDOM_STATE = 42
-MIN_PRECISION = 0.60
+MIN_PRECISION = 0.35
 VAL_YEAR_COUNT = 6
 TEST_YEAR_COUNT = 6
 DEFAULT_DATA_FILE = "Golitcino72-17d2_CLEAN.xlsx"
@@ -120,6 +120,7 @@ TEMPORAL_SOURCE_COLUMNS = [
 TEMPORAL_LAG_STEPS = [2, 7]
 TEMPORAL_ROLLING_WINDOWS = [3]
 TEMPORAL_ROLLING_STATS = ["mean", "std", "min", "max"]
+ACCUMULATION_WINDOWS = [3, 5, 7, 10]
 ORACLE_DEFAULT_PREDICT_FEATURES = [
     "t_min",
     "t_max",
@@ -167,6 +168,7 @@ class ExperimentResult:
     val_recall: float | None = None
     val_f1: float | None = None
     val_accuracy: float | None = None
+    min_precision: float = MIN_PRECISION
 
 
 def parse_args() -> argparse.Namespace:
@@ -177,6 +179,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-sizes", nargs="+", type=int, default=[7], help="Window sizes, e.g. --window-sizes 5 7 9")
     parser.add_argument("--top-n", type=int, default=1, help="Keep only N best results per model ranked by the notebook rule.")
     parser.add_argument("--tune-trials", type=int, default=0, help="Number of Optuna trials per tunable experiment.")
+    parser.add_argument("--min-precision", type=float, default=MIN_PRECISION, help="Minimum precision floor used for threshold tuning and ranking.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Output root directory.")
     parser.add_argument("--upload-dataset", action="store_true", help="Upload zips to a Kaggle Dataset after each experiment.")
     parser.add_argument("--dataset-slug", default=None, help="Kaggle Dataset slug, e.g. username/dataset-name.")
@@ -397,6 +400,121 @@ def fill_weather_missing(
     return work, fill_values
 
 
+def consecutive_true_count(values: pd.Series) -> pd.Series:
+    mask = values.fillna(0).astype(bool).astype(int)
+    return mask.groupby((mask == 0).cumsum()).cumsum().astype(float)
+
+
+def add_accumulation_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    work = df.copy()
+    created: list[str] = []
+    grouped = work.groupby("year", sort=False)
+
+    if "precipitation" in work.columns:
+        work["fe_wet_day"] = ((work["precipitation"] > 0) | (work.get("is_rain", 0) > 0)).astype(float)
+    elif "is_rain" in work.columns:
+        work["fe_wet_day"] = (work["is_rain"] > 0).astype(float)
+    else:
+        work["fe_wet_day"] = 0.0
+    created.append("fe_wet_day")
+
+    if "t_avg" in work.columns:
+        work["fe_temp_8_25"] = work["t_avg"].between(8, 25).astype(float)
+        work["fe_temp_10_25"] = work["t_avg"].between(10, 25).astype(float)
+        work["fe_temp_10_20"] = work["t_avg"].between(10, 20).astype(float)
+        work["fe_temp_distance_15"] = (work["t_avg"] - 15).abs()
+        created.extend(["fe_temp_8_25", "fe_temp_10_25", "fe_temp_10_20", "fe_temp_distance_15"])
+    else:
+        for column in ["fe_temp_8_25", "fe_temp_10_25", "fe_temp_10_20"]:
+            work[column] = 0.0
+
+    if "t_min" in work.columns:
+        work["fe_tmin_ge_10"] = (work["t_min"] >= 10).astype(float)
+        created.append("fe_tmin_ge_10")
+    else:
+        work["fe_tmin_ge_10"] = 0.0
+
+    if "t_max" in work.columns:
+        work["fe_tmax_le_25"] = (work["t_max"] <= 25).astype(float)
+        created.append("fe_tmax_le_25")
+    else:
+        work["fe_tmax_le_25"] = 0.0
+
+    if "cloudiness" in work.columns:
+        work["fe_high_cloud"] = (work["cloudiness"] >= 6).astype(float)
+        created.append("fe_high_cloud")
+    else:
+        work["fe_high_cloud"] = 0.0
+
+    work["fe_warm_wet_day"] = (work["fe_wet_day"].astype(bool) & work["fe_temp_8_25"].astype(bool)).astype(float)
+    work["fe_cool_moist_day"] = (
+        (work["fe_wet_day"].astype(bool) | work["fe_high_cloud"].astype(bool))
+        & work["fe_temp_10_20"].astype(bool)
+    ).astype(float)
+    work["fe_hutton_proxy_day"] = (
+        work["fe_tmin_ge_10"].astype(bool)
+        & (work["fe_wet_day"].astype(bool) | work["fe_high_cloud"].astype(bool))
+    ).astype(float)
+    created.extend(["fe_warm_wet_day", "fe_cool_moist_day", "fe_hutton_proxy_day"])
+
+    work["fe_consecutive_wet_days"] = grouped["fe_wet_day"].transform(consecutive_true_count)
+    work["fe_consecutive_warm_wet_days"] = grouped["fe_warm_wet_day"].transform(consecutive_true_count)
+    work["fe_consecutive_hutton_proxy_days"] = grouped["fe_hutton_proxy_day"].transform(consecutive_true_count)
+    created.extend([
+        "fe_consecutive_wet_days",
+        "fe_consecutive_warm_wet_days",
+        "fe_consecutive_hutton_proxy_days",
+    ])
+
+    for window in ACCUMULATION_WINDOWS:
+        for source, stat in [
+            ("precipitation", "sum"),
+            ("fe_wet_day", "sum"),
+            ("fe_warm_wet_day", "sum"),
+            ("fe_cool_moist_day", "sum"),
+            ("fe_hutton_proxy_day", "sum"),
+            ("fe_temp_8_25", "sum"),
+            ("fe_temp_10_25", "sum"),
+            ("fe_tmin_ge_10", "sum"),
+            ("fe_high_cloud", "sum"),
+            ("cloudiness", "mean"),
+            ("cloudiness", "max"),
+            ("t_avg", "mean"),
+            ("t_avg", "min"),
+            ("t_avg", "max"),
+            ("t_min", "min"),
+            ("t_max", "max"),
+        ]:
+            if source not in work.columns:
+                continue
+            prefix = source if source.startswith("fe_") else f"fe_{source}"
+            name = f"{prefix}_roll_{window}_{stat}"
+            rolled = grouped[source].rolling(window, min_periods=1)
+            if stat == "sum":
+                values = rolled.sum()
+            elif stat == "mean":
+                values = rolled.mean()
+            elif stat == "min":
+                values = rolled.min()
+            elif stat == "max":
+                values = rolled.max()
+            else:
+                raise ValueError(stat)
+            work[name] = values.reset_index(level=0, drop=True)
+            created.append(name)
+
+    if {"fe_warm_wet_day", "fe_wet_day"}.issubset(work.columns):
+        for window in [3, 5, 7]:
+            wet = grouped["fe_wet_day"].rolling(window, min_periods=1).sum().reset_index(level=0, drop=True)
+            warm_wet = grouped["fe_warm_wet_day"].rolling(window, min_periods=1).sum().reset_index(level=0, drop=True)
+            name = f"fe_warm_wet_share_roll_{window}"
+            work[name] = warm_wet / wet.replace(0, np.nan)
+            work[name] = work[name].fillna(0.0)
+            created.append(name)
+
+    return work, list(dict.fromkeys(created))
+
+
 def add_variant_features(df: pd.DataFrame, window_size: int, variant: str, no_y: bool = False) -> tuple[pd.DataFrame, list[str]]:
     if variant not in FEATURE_VARIANTS:
         raise ValueError(f"Unknown feature variant: {variant}")
@@ -444,6 +562,8 @@ def add_variant_features(df: pd.DataFrame, window_size: int, variant: str, no_y:
             )
             work[trend_col] = current_mean - previous_mean
             feature_cols.append(trend_col)
+        work, accumulation_cols = add_accumulation_features(work)
+        feature_cols.extend(accumulation_cols)
 
     feature_cols = list(dict.fromkeys(feature_cols))
     if no_y:
@@ -603,13 +723,18 @@ def build_estimator(model: str, params: dict[str, Any] | None = None) -> Any:
     raise ValueError(f"Model {model} is not a tabular sklearn estimator.")
 
 
-def threshold_objective_value(recall_value: float, precision_value: float, f1_value: float = 0.0) -> float:
-    if precision_value >= MIN_PRECISION:
+def threshold_objective_value(
+    recall_value: float,
+    precision_value: float,
+    f1_value: float = 0.0,
+    min_precision: float = MIN_PRECISION,
+) -> float:
+    if precision_value >= min_precision:
         return 1.0 + recall_value + 0.001 * precision_value + 0.000001 * f1_value
     return precision_value + 0.001 * recall_value + 0.000001 * f1_value
 
 
-def search_threshold(y_true: np.ndarray, scores: np.ndarray) -> dict[str, float]:
+def search_threshold(y_true: np.ndarray, scores: np.ndarray, min_precision: float = MIN_PRECISION) -> dict[str, float]:
     scores = np.asarray(scores, dtype=float).reshape(-1)
     y_true = np.asarray(y_true).astype(int).reshape(-1)
     if y_true.size == 0 or scores.size == 0:
@@ -637,11 +762,11 @@ def search_threshold(y_true: np.ndarray, scores: np.ndarray) -> dict[str, float]
             "recall": float(recall_value),
             "precision": float(precision_value),
             "f1": float(f1_value),
-            "objective": float(threshold_objective_value(recall_value, precision_value, f1_value)),
+            "objective": float(threshold_objective_value(recall_value, precision_value, f1_value, min_precision)),
         })
 
     candidates_df = pd.DataFrame(candidates)
-    eligible = candidates_df[candidates_df["precision"] >= MIN_PRECISION]
+    eligible = candidates_df[candidates_df["precision"] >= min_precision]
     if not eligible.empty:
         best_row = eligible.sort_values(["recall", "precision", "f1", "threshold"], ascending=[False, False, False, True]).iloc[0]
     else:
@@ -697,9 +822,16 @@ def safe_pr_auc(y_true: pd.Series | np.ndarray, scores: np.ndarray | None) -> fl
     return float(average_precision_score(y_arr[:usable], score_arr[:usable]))
 
 
-def notebook_rank_key_values(precision: float, recall: float, pr_auc: float, f1: float, roc_auc: float) -> tuple[int, float, float, float, float]:
+def notebook_rank_key_values(
+    precision: float,
+    recall: float,
+    pr_auc: float,
+    f1: float,
+    roc_auc: float,
+    min_precision: float = MIN_PRECISION,
+) -> tuple[int, float, float, float, float]:
     return (
-        int(np.nan_to_num(precision, nan=-1.0) >= MIN_PRECISION),
+        int(np.nan_to_num(precision, nan=-1.0) >= min_precision),
         float(np.nan_to_num(recall, nan=-1.0)),
         float(np.nan_to_num(pr_auc, nan=-1.0)),
         float(np.nan_to_num(f1, nan=-1.0)),
@@ -708,10 +840,25 @@ def notebook_rank_key_values(precision: float, recall: float, pr_auc: float, f1:
 
 
 def result_rank_key(result: ExperimentResult) -> tuple[int, float, float, float, float]:
-    return notebook_rank_key_values(result.precision, result.recall, result.pr_auc, result.f1, result.roc_auc)
+    return notebook_rank_key_values(
+        result.precision,
+        result.recall,
+        result.pr_auc,
+        result.f1,
+        result.roc_auc,
+        result.min_precision,
+    )
 
 
-def tune_params(model: str, x_train: pd.DataFrame, y_train: pd.Series, x_val: pd.DataFrame, y_val: pd.Series, trials: int) -> dict[str, Any]:
+def tune_params(
+    model: str,
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    x_val: pd.DataFrame,
+    y_val: pd.Series,
+    trials: int,
+    min_precision: float,
+) -> dict[str, Any]:
     if trials <= 0 or optuna is None or model not in {"logreg", "svm", "rf", "xgboost", "catboost", "lightgbm"}:
         return {}
 
@@ -727,16 +874,27 @@ def tune_params(model: str, x_train: pd.DataFrame, y_train: pd.Series, x_val: pd
         estimator = build_estimator(model, params)
         if model in {"xgboost", "catboost", "lightgbm"}:
             fit_transferred_estimator(model, estimator, x_train, y_train, x_val, y_val)
+            val_scores = predict_transferred_scores(model, estimator, x_val)
+            if val_scores is not None:
+                threshold_info = search_threshold(y_val.to_numpy(dtype=int), val_scores, min_precision)
+                return threshold_objective_value(
+                    threshold_info["recall"],
+                    threshold_info["precision"],
+                    threshold_info["f1"],
+                    min_precision,
+                )
             pred = predict_transferred_binary(model, estimator, x_val)
         else:
             estimator.fit(x_train, y_train)
-            if model == "logreg":
-                val_scores = predict_scores(estimator, x_val)
-                if val_scores is None:
-                    pred = estimator.predict(x_val)
-                    return f1_score(y_val, pred, zero_division=0)
-                threshold_info = search_threshold(y_val.to_numpy(dtype=int), val_scores)
-                return threshold_objective_value(threshold_info["recall"], threshold_info["precision"], threshold_info["f1"])
+            val_scores = predict_scores(estimator, x_val)
+            if val_scores is not None:
+                threshold_info = search_threshold(y_val.to_numpy(dtype=int), val_scores, min_precision)
+                return threshold_objective_value(
+                    threshold_info["recall"],
+                    threshold_info["precision"],
+                    threshold_info["f1"],
+                    min_precision,
+                )
             pred = estimator.predict(x_val)
         return f1_score(y_val, pred, zero_division=0)
 
@@ -770,6 +928,18 @@ def run_arima_like(train_df: pd.DataFrame, test_df: pd.DataFrame, target_col: st
     y_score = np.asarray(scores, dtype=float)
     y_pred = (y_score >= 0.5).astype(int)
     return y_true, y_pred, y_score, {"note": "ARIMA-style rolling target-rate baseline from notebook time-series family"}
+
+
+def blitecast_scores(frame: pd.DataFrame) -> np.ndarray:
+    aligned = frame.sort_values(["year", "day"])
+    precipitation = aligned.get("precipitation", pd.Series(0, index=aligned.index)).fillna(0)
+    t_avg = aligned.get("t_avg", pd.Series(0, index=aligned.index)).fillna(0)
+    cloudiness = aligned.get("cloudiness", pd.Series(0, index=aligned.index)).fillna(0)
+    return (
+        0.45 * (precipitation > 0).astype(float)
+        + 0.30 * t_avg.between(12, 20).astype(float)
+        + 0.25 * (cloudiness >= 6).astype(float)
+    ).to_numpy()
 
 
 
@@ -1146,67 +1316,95 @@ def run_one(
     threshold_info: dict[str, float] = {}
     val_metric_values: dict[str, float] = {}
     if model in {"logreg", "svm", "rf", "xgboost", "catboost", "lightgbm"}:
-        best_params = tune_params(model, x_train, y_train, x_val, y_val, args.tune_trials)
+        best_params = tune_params(model, x_train, y_train, x_val, y_val, args.tune_trials, args.min_precision)
         estimator = build_estimator(model, best_params)
-        if model == "logreg" and not x_val.empty:
-            estimator.fit(x_train, y_train)
-            val_score = predict_scores(estimator, x_val)
-            if val_score is None:
-                val_pred = estimator.predict(x_val).astype(int)
-                y_pred = estimator.predict(x_test).astype(int)
-                y_score = predict_scores(estimator, x_test)
-                selected_threshold = 0.5
-                threshold_info = {
-                    "threshold": selected_threshold,
-                    "recall": float(recall_score(y_val, val_pred, zero_division=0)),
-                    "precision": float(precision_score(y_val, val_pred, zero_division=0)),
-                    "f1": float(f1_score(y_val, val_pred, zero_division=0)),
-                    "objective": 0.0,
-                }
-                val_metric_values = {
-                    "val_precision": threshold_info["precision"],
-                    "val_recall": threshold_info["recall"],
-                    "val_f1": threshold_info["f1"],
-                    "val_accuracy": float(accuracy_score(y_val, val_pred)),
-                }
-            else:
-                threshold_info = search_threshold(y_val.to_numpy(dtype=int), val_score)
+        if model in {"xgboost", "catboost", "lightgbm"}:
+            fit_transferred_estimator(model, estimator, x_train, y_train, x_val if not x_val.empty else None, y_val if not x_val.empty else None)
+            val_score = predict_transferred_scores(model, estimator, x_val) if not x_val.empty else None
+            test_score = predict_transferred_scores(model, estimator, x_test)
+            if val_score is not None and test_score is not None:
+                threshold_info = search_threshold(y_val.to_numpy(dtype=int), val_score, args.min_precision)
                 selected_threshold = threshold_info["threshold"]
-                y_score = predict_scores(estimator, x_test)
-                if y_score is None:
-                    y_pred = estimator.predict(x_test).astype(int)
-                else:
-                    y_pred = (np.asarray(y_score, dtype=float) >= selected_threshold).astype(int)
+                y_score = test_score
+                y_pred = (np.asarray(y_score, dtype=float) >= selected_threshold).astype(int)
                 val_metric_values = validation_metrics(y_val, val_score, selected_threshold)
-        else:
-            fit_x = pd.concat([x_train, x_val], ignore_index=True) if not x_val.empty else x_train
-            fit_y = pd.concat([y_train, y_val], ignore_index=True) if not y_val.empty else y_train
-            if model in {"xgboost", "catboost", "lightgbm"}:
-                fit_transferred_estimator(model, estimator, fit_x, fit_y, x_val if not x_val.empty else None, y_val if not x_val.empty else None)
-                y_pred = predict_transferred_binary(model, estimator, x_test)
-                y_score = predict_transferred_scores(model, estimator, x_test)
             else:
-                estimator.fit(fit_x, fit_y)
+                y_pred = predict_transferred_binary(model, estimator, x_test)
+                y_score = test_score
+                if val_score is None and not x_val.empty:
+                    val_pred = predict_transferred_binary(model, estimator, x_val)
+                    threshold_info = {
+                        "threshold": 0.5,
+                        "recall": float(recall_score(y_val, val_pred, zero_division=0)),
+                        "precision": float(precision_score(y_val, val_pred, zero_division=0)),
+                        "f1": float(f1_score(y_val, val_pred, zero_division=0)),
+                        "objective": 0.0,
+                    }
+                    val_metric_values = {
+                        "val_precision": threshold_info["precision"],
+                        "val_recall": threshold_info["recall"],
+                        "val_f1": threshold_info["f1"],
+                        "val_accuracy": float(accuracy_score(y_val, val_pred)),
+                    }
+        else:
+            estimator.fit(x_train, y_train)
+            val_score = predict_scores(estimator, x_val) if not x_val.empty else None
+            test_score = predict_scores(estimator, x_test)
+            if val_score is not None and test_score is not None:
+                threshold_info = search_threshold(y_val.to_numpy(dtype=int), val_score, args.min_precision)
+                selected_threshold = threshold_info["threshold"]
+                y_score = test_score
+                y_pred = (np.asarray(y_score, dtype=float) >= selected_threshold).astype(int)
+                val_metric_values = validation_metrics(y_val, val_score, selected_threshold)
+            else:
                 y_pred = estimator.predict(x_test).astype(int)
-                y_score = predict_scores(estimator, x_test)
+                y_score = test_score
+                if not x_val.empty:
+                    val_pred = estimator.predict(x_val).astype(int)
+                    selected_threshold = 0.5
+                    threshold_info = {
+                        "threshold": selected_threshold,
+                        "recall": float(recall_score(y_val, val_pred, zero_division=0)),
+                        "precision": float(precision_score(y_val, val_pred, zero_division=0)),
+                        "f1": float(f1_score(y_val, val_pred, zero_division=0)),
+                        "objective": 0.0,
+                    }
+                    val_metric_values = {
+                        "val_precision": threshold_info["precision"],
+                        "val_recall": threshold_info["recall"],
+                        "val_f1": threshold_info["f1"],
+                        "val_accuracy": float(accuracy_score(y_val, val_pred)),
+                    }
     elif model == "blitecast":
         aligned = test_df.sort_values(["year", "day"])
-        precipitation = aligned.get("precipitation", pd.Series(0, index=aligned.index)).fillna(0)
-        t_avg = aligned.get("t_avg", pd.Series(0, index=aligned.index)).fillna(0)
-        cloudiness = aligned.get("cloudiness", pd.Series(0, index=aligned.index)).fillna(0)
-        y_score = (
-            0.45 * (precipitation > 0).astype(float)
-            + 0.30 * t_avg.between(12, 20).astype(float)
-            + 0.25 * (cloudiness >= 6).astype(float)
-        ).to_numpy()
-        y_pred = (y_score >= 0.5).astype(int)
+        val_score = blitecast_scores(val_df) if not val_df.empty else None
+        y_score = blitecast_scores(aligned)
+        if val_score is not None:
+            threshold_info = search_threshold(val_df[target_col].astype(int).to_numpy(), val_score, args.min_precision)
+            selected_threshold = threshold_info["threshold"]
+            val_metric_values = validation_metrics(val_df[target_col].astype(int), val_score, selected_threshold)
+        else:
+            selected_threshold = 0.5
+        y_pred = (y_score >= selected_threshold).astype(int)
         y_test = aligned[target_col].astype(int)
         estimator = None
     elif model in {"arima", "sarima"}:
+        if not val_df.empty:
+            _, _, val_score, _ = run_arima_like(train_df, val_df, target_col)
+            if val_score is not None:
+                threshold_info = search_threshold(val_df.sort_values(["year", "day"])[target_col].astype(int).to_numpy(), val_score, args.min_precision)
+                selected_threshold = threshold_info["threshold"]
+                val_metric_values = validation_metrics(
+                    val_df.sort_values(["year", "day"])[target_col].astype(int),
+                    val_score,
+                    selected_threshold,
+                )
         y_true_arima, y_pred, y_score, best_params = run_arima_like(pd.concat([train_df, val_df]), test_df, target_col)
         if model == "sarima":
             best_params["seasonal_note"] = "SARIMA-compatible baseline; full statsmodels SARIMAX is available through src.models when statsmodels is installed"
         y_test = pd.Series(y_true_arima)
+        if selected_threshold is not None and y_score is not None:
+            y_pred = (np.asarray(y_score, dtype=float) >= selected_threshold).astype(int)
         estimator = None
     else:
         raise ValueError(model)
@@ -1226,7 +1424,9 @@ def run_one(
         pr_auc,
         f1,
         roc_auc,
+        args.min_precision,
     )
+    rank_rule = f"precision>={args.min_precision:.2f} -> recall -> pr_auc -> f1 -> roc_auc"
     result_dir = safe_folder_name(args.output_dir, model, f1, variant, oracle=args.oracle)
     result_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1242,8 +1442,9 @@ def run_one(
         "accuracy": accuracy,
         "roc_auc": roc_auc,
         "pr_auc": pr_auc,
+        "min_precision": args.min_precision,
         "precision_floor_met": bool(precision_floor_met),
-        "rank_rule": "precision>=0.60 -> recall -> pr_auc -> f1 -> roc_auc",
+        "rank_rule": rank_rule,
         "threshold": selected_threshold,
         "threshold_objective": threshold_info.get("objective"),
         "val_precision": val_metric_values.get("val_precision"),
@@ -1272,7 +1473,7 @@ def run_one(
             "horizon": horizon,
             "window_size": window_size,
             "selected_threshold": selected_threshold,
-            "min_precision": MIN_PRECISION,
+            "min_precision": args.min_precision,
             "validation": val_metric_values,
             "selection": threshold_info,
         }
@@ -1317,8 +1518,9 @@ def run_one(
                 "threshold_objective": threshold_info.get("objective"),
                 "roc_auc": roc_auc,
                 "pr_auc": pr_auc,
+                "min_precision": args.min_precision,
                 "precision_floor_met": bool(precision_floor_met),
-                "rank_rule": "precision>=0.60 -> recall -> pr_auc -> f1 -> roc_auc",
+                "rank_rule": rank_rule,
                 "rank_key": [precision_floor_met, rank_recall, rank_pr_auc, rank_f1, rank_roc_auc],
                 **val_metric_values,
             }
@@ -1376,6 +1578,7 @@ def run_one(
         val_recall=val_metric_values.get("val_recall"),
         val_f1=val_metric_values.get("val_f1"),
         val_accuracy=val_metric_values.get("val_accuracy"),
+        min_precision=args.min_precision,
     )
 
 
@@ -1411,6 +1614,8 @@ def enforce_top_n(results: list[ExperimentResult], top_n: int) -> list[Experimen
 
 def main() -> int:
     args = parse_args()
+    if not 0.0 <= args.min_precision <= 1.0:
+        raise ValueError("--min-precision must be between 0 and 1.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     models = choose_models(args.models)
     data_path = find_data_file(args.data)
@@ -1444,11 +1649,12 @@ def main() -> int:
     summary_rows = []
     for result in results:
         rank_key = result_rank_key(result)
+        rank_rule = f"precision>={result.min_precision:.2f} -> recall -> pr_auc -> f1 -> roc_auc"
         summary_row = result.__dict__ | {
             "output_dir": str(result.output_dir),
             "zip_path": str(result.zip_path),
             "precision_floor_met": bool(rank_key[0]),
-            "rank_rule": "precision>=0.60 -> recall -> pr_auc -> f1 -> roc_auc",
+            "rank_rule": rank_rule,
             "rank_key": json.dumps(list(rank_key)),
         }
         if args.oracle:

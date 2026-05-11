@@ -69,6 +69,7 @@ DEFAULT_DATA_FILE = "Golitcino72-17d2_CLEAN.xlsx"
 DEFAULT_OUTPUT_DIR = Path("/kaggle/working/outputs")
 SUPPORTED_MODELS = ("logreg", "svm", "rf", "gru", "tft", "blitecast", "simcast", "xgboost", "catboost", "lightgbm", "arima", "sarima")
 TABULAR_WINDOW_MODELS = {"logreg", "svm", "rf", "xgboost", "catboost", "lightgbm"}
+WINDOW_NAMED_MODELS = TABULAR_WINDOW_MODELS | {"gru", "tft", "blitecast", "simcast", "arima", "sarima"}
 FEATURE_VARIANTS = (
     "baseline",
     "interaction_fe",
@@ -1429,18 +1430,26 @@ def top_feature_importances(
     return labels[order], values[order]
 
 
-def safe_folder_name(output_root: Path, model: str, f1_value: float, variant: str | None = None, oracle: bool = False) -> Path:
+def safe_folder_name(
+    output_root: Path,
+    model: str,
+    f1_value: float,
+    variant: str | None = None,
+    oracle: bool = False,
+    window_size: int | None = None,
+) -> Path:
     score = int(round(max(0.0, min(1.0, f1_value)) * 100))
     prefix = f"{model}_{variant}" if variant else model
     if oracle:
         prefix = f"{prefix}_oracle"
-    base = output_root / f"{prefix}_{score:02d}"
+    suffix = f"_{int(window_size)}" if window_size is not None else ""
+    base = output_root / f"{prefix}_{score:02d}{suffix}"
     if not base.exists():
         return base
-    suffix = 2
-    while (output_root / f"{prefix}_{score:02d}_{suffix}").exists():
-        suffix += 1
-    return output_root / f"{prefix}_{score:02d}_{suffix}"
+    collision_suffix = 2
+    while (output_root / f"{prefix}_{score:02d}{suffix}_{collision_suffix}").exists():
+        collision_suffix += 1
+    return output_root / f"{prefix}_{score:02d}{suffix}_{collision_suffix}"
 
 
 def save_plots(result_dir: Path, y_true: np.ndarray, y_pred: np.ndarray, y_score: np.ndarray | None, estimator: Any, feature_cols: list[str]) -> None:
@@ -1725,7 +1734,14 @@ def run_one(
         args.min_precision,
     )
     rank_rule = f"precision>={args.min_precision:.2f} -> recall -> pr_auc -> f1 -> roc_auc"
-    result_dir = safe_folder_name(args.output_dir, model, f1, variant, oracle=args.oracle)
+    result_dir = safe_folder_name(
+        args.output_dir,
+        model,
+        f1,
+        variant,
+        oracle=args.oracle,
+        window_size=window_size if model in WINDOW_NAMED_MODELS else None,
+    )
     result_dir.mkdir(parents=True, exist_ok=True)
 
     metrics_row = {

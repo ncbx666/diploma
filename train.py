@@ -934,24 +934,41 @@ def predict_scores(estimator: Any, x_test: pd.DataFrame) -> np.ndarray | None:
     return None
 
 
-def arima_default_params(model: str) -> dict[str, Any]:
+def arima_default_params(model: str, window_size: int = 7, moving_average_order: int = 0) -> dict[str, Any]:
+    lookback = max(1, int(window_size))
+    ma_order = max(0, int(moving_average_order))
     if model == "arima":
         return {
-            "order": (1, 0, 0),
+            "order": (lookback, 0, ma_order),
             "seasonal_order": (0, 0, 0, 0),
+            "lookback_days": lookback,
+            "moving_average_order": ma_order,
             "inference": "leakage-free train-history forecast",
         }
     if model == "sarima":
         return {
-            "order": (1, 0, 0),
-            "seasonal_order": (1, 0, 0, 7),
+            "order": (lookback, 0, ma_order),
+            "seasonal_order": (1, 0, 0, lookback),
+            "lookback_days": lookback,
+            "moving_average_order": ma_order,
             "inference": "leakage-free train-history forecast",
         }
     raise ValueError(model)
 
 
-def forecast_arima_scores(train_y: pd.Series, steps: int, model: str) -> tuple[np.ndarray, dict[str, Any]]:
-    params = arima_default_params(model)
+def arima_moving_average_orders(window_size: int) -> list[int]:
+    lookback = max(1, int(window_size))
+    return list(dict.fromkeys([0, 1, lookback]))
+
+
+def forecast_arima_scores(
+    train_y: pd.Series,
+    steps: int,
+    model: str,
+    window_size: int,
+    moving_average_order: int = 0,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    params = arima_default_params(model, window_size, moving_average_order)
     if steps <= 0:
         return np.array([], dtype=float), params
     history = pd.Series(train_y).dropna().astype(float).reset_index(drop=True)
@@ -979,24 +996,49 @@ def run_arima_sarima_forecast(
     val_df: pd.DataFrame,
     test_df: pd.DataFrame,
     target_col: str,
+    window_size: int,
+    min_precision: float,
 ) -> tuple[pd.Series, pd.Series, np.ndarray, np.ndarray, dict[str, Any]]:
     train_sorted = train_df.sort_values(["year", "day"]).reset_index(drop=True)
     val_sorted = val_df.sort_values(["year", "day"]).reset_index(drop=True)
     test_sorted = test_df.sort_values(["year", "day"]).reset_index(drop=True)
 
     total_steps = len(val_sorted) + len(test_sorted)
-    all_scores, params = forecast_arima_scores(train_sorted[target_col], total_steps, model)
-    val_score = all_scores[: len(val_sorted)]
-    test_score = all_scores[len(val_sorted) :]
-    params["validation_steps"] = len(val_sorted)
-    params["test_steps"] = len(test_sorted)
-    params["target_used_for_score"] = "train split only"
+    val_y = val_sorted[target_col].astype(int)
+    best_scores: np.ndarray | None = None
+    best_params: dict[str, Any] | None = None
+    best_threshold: dict[str, float] | None = None
+    for ma_order in arima_moving_average_orders(window_size):
+        candidate_scores, candidate_params = forecast_arima_scores(
+            train_sorted[target_col],
+            total_steps,
+            model,
+            window_size,
+            ma_order,
+        )
+        candidate_val_score = candidate_scores[: len(val_sorted)]
+        threshold_info = search_threshold(val_y.to_numpy(dtype=int), candidate_val_score, min_precision)
+        candidate_params["validation_threshold_objective"] = threshold_info["objective"]
+        candidate_params["validation_threshold"] = threshold_info["threshold"]
+        if best_threshold is None or threshold_info["objective"] > best_threshold["objective"]:
+            best_scores = candidate_scores
+            best_params = candidate_params
+            best_threshold = threshold_info
+    if best_scores is None or best_params is None:
+        best_scores, best_params = forecast_arima_scores(train_sorted[target_col], total_steps, model, window_size, 0)
+    val_score = best_scores[: len(val_sorted)]
+    test_score = best_scores[len(val_sorted) :]
+    best_params["moving_average_candidates"] = arima_moving_average_orders(window_size)
+    best_params["selection"] = "best validation threshold objective across fixed MA orders"
+    best_params["validation_steps"] = len(val_sorted)
+    best_params["test_steps"] = len(test_sorted)
+    best_params["target_used_for_score"] = "train split only"
     return (
-        val_sorted[target_col].astype(int),
+        val_y,
         test_sorted[target_col].astype(int),
         val_score,
         test_score,
-        params,
+        best_params,
     )
 
 
@@ -1610,7 +1652,7 @@ def run_one(
         y_pred = (y_score >= selected_threshold).astype(int)
     elif model in {"arima", "sarima"}:
         y_val_arima, y_test, val_score, y_score, best_params = run_arima_sarima_forecast(
-            model, train_df, val_df, test_df, target_col
+            model, train_df, val_df, test_df, target_col, window_size, args.min_precision
         )
         threshold_info = search_threshold(y_val_arima.to_numpy(dtype=int), val_score, args.min_precision)
         selected_threshold = threshold_info["threshold"]

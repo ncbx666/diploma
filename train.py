@@ -68,6 +68,7 @@ TEST_YEAR_COUNT = 6
 DEFAULT_DATA_FILE = "Golitcino72-17d2_CLEAN.xlsx"
 DEFAULT_OUTPUT_DIR = Path("/kaggle/working/outputs")
 SUPPORTED_MODELS = ("logreg", "svm", "rf", "gru", "tft", "blitecast", "simcast", "xgboost", "catboost", "lightgbm", "arima", "sarima")
+TABULAR_WINDOW_MODELS = {"logreg", "svm", "rf", "xgboost", "catboost", "lightgbm"}
 FEATURE_VARIANTS = (
     "baseline",
     "interaction_fe",
@@ -607,6 +608,31 @@ def finalize_prepared_split(frame: pd.DataFrame, feature_cols: list[str], target
     return subset
 
 
+def make_tabular_window_features(
+    frame: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    window_size: int,
+) -> tuple[pd.DataFrame, list[str]]:
+    lookback = int(window_size)
+    if lookback <= 0:
+        raise ValueError("window_size must be positive")
+    work = frame.copy().sort_values(["year", "day"]).reset_index(drop=True)
+    grouped = work.groupby("year", sort=False)
+    window_cols: list[str] = []
+    shifted_columns: dict[str, pd.Series] = {}
+    for feature in feature_cols:
+        for lag in range(lookback - 1, -1, -1):
+            column = f"{feature}_win_lag_{lag}"
+            shifted_columns[column] = grouped[feature].shift(lag)
+            window_cols.append(column)
+    window_frame = pd.concat(
+        [work[["year", "day", target_col]], pd.DataFrame(shifted_columns, index=work.index)],
+        axis=1,
+    )
+    return finalize_prepared_split(window_frame, window_cols, target_col), window_cols
+
+
 def prepare_features(df: pd.DataFrame, target_col: str, window_size: int, variant: str, no_y: bool = False) -> tuple[pd.DataFrame, list[str]]:
     """Backward-compatible single-frame feature preparation."""
     filled, _ = fill_weather_missing(df)
@@ -961,6 +987,15 @@ def arima_moving_average_orders(window_size: int) -> list[int]:
     return list(dict.fromkeys([0, 1, lookback]))
 
 
+def arima_candidate_orders(window_size: int) -> list[tuple[int, int]]:
+    lookback = max(1, int(window_size))
+    orders: list[tuple[int, int]] = []
+    for ar_order in [1, lookback]:
+        for ma_order in arima_moving_average_orders(window_size):
+            orders.append((ar_order, ma_order))
+    return list(dict.fromkeys(orders))
+
+
 def forecast_arima_scores(
     train_y: pd.Series,
     steps: int,
@@ -1008,14 +1043,15 @@ def run_arima_sarima_forecast(
     best_scores: np.ndarray | None = None
     best_params: dict[str, Any] | None = None
     best_threshold: dict[str, float] | None = None
-    for ma_order in arima_moving_average_orders(window_size):
+    for ar_order, ma_order in arima_candidate_orders(window_size):
         candidate_scores, candidate_params = forecast_arima_scores(
             train_sorted[target_col],
             total_steps,
             model,
-            window_size,
+            ar_order,
             ma_order,
         )
+        candidate_params["requested_window_size"] = int(window_size)
         candidate_val_score = candidate_scores[: len(val_sorted)]
         threshold_info = search_threshold(val_y.to_numpy(dtype=int), candidate_val_score, min_precision)
         candidate_params["validation_threshold_objective"] = threshold_info["objective"]
@@ -1025,11 +1061,13 @@ def run_arima_sarima_forecast(
             best_params = candidate_params
             best_threshold = threshold_info
     if best_scores is None or best_params is None:
-        best_scores, best_params = forecast_arima_scores(train_sorted[target_col], total_steps, model, window_size, 0)
+        best_scores, best_params = forecast_arima_scores(train_sorted[target_col], total_steps, model, 1, 0)
+        best_params["requested_window_size"] = int(window_size)
     val_score = best_scores[: len(val_sorted)]
     test_score = best_scores[len(val_sorted) :]
+    best_params["order_candidates"] = [{"ar_order": ar_order, "ma_order": ma_order} for ar_order, ma_order in arima_candidate_orders(window_size)]
     best_params["moving_average_candidates"] = arima_moving_average_orders(window_size)
-    best_params["selection"] = "best validation threshold objective across fixed MA orders"
+    best_params["selection"] = "best validation threshold objective across fixed AR/MA orders"
     best_params["validation_steps"] = len(val_sorted)
     best_params["test_steps"] = len(test_sorted)
     best_params["target_used_for_score"] = "train split only"
@@ -1547,6 +1585,13 @@ def run_one(
         predict_features=args.predict_features,
         no_y=args.no_y,
     )
+    fill_feature_cols = feature_cols
+    if model in TABULAR_WINDOW_MODELS:
+        base_feature_cols = feature_cols
+        train_df, feature_cols = make_tabular_window_features(train_df, base_feature_cols, target_col, window_size)
+        val_df, _ = make_tabular_window_features(val_df, base_feature_cols, target_col, window_size)
+        test_df, _ = make_tabular_window_features(test_df, base_feature_cols, target_col, window_size)
+        fill_feature_cols = base_feature_cols
     oracle_feature_cols = [col for col in feature_cols if col.startswith("oracle_")]
     if train_df.empty or test_df.empty:
         print(f"SKIP {model} variant={variant} h{horizon} w{window_size}: empty train/test split")
@@ -1718,7 +1763,7 @@ def run_one(
     write_csv(result_dir / "metrics.csv", metrics)
     config_fill_values = fill_values
     if args.oracle or args.no_y:
-        config_fill_values = {key: value for key, value in fill_values.items() if key in feature_cols}
+        config_fill_values = {key: value for key, value in fill_values.items() if key in fill_feature_cols}
     if selected_threshold is not None:
         threshold_payload = {
             "model": model,

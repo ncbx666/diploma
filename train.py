@@ -60,12 +60,12 @@ except Exception:  # pragma: no cover - depends on runtime
     plt = None
 
 RANDOM_STATE = 42
-MIN_PRECISION = 0.35
+MIN_PRECISION = 0.60
 VAL_YEAR_COUNT = 6
 TEST_YEAR_COUNT = 6
 DEFAULT_DATA_FILE = "Golitcino72-17d2_CLEAN.xlsx"
 DEFAULT_OUTPUT_DIR = Path("/kaggle/working/outputs")
-SUPPORTED_MODELS = ("logreg", "svm", "rf", "gru", "tft", "blitecast", "xgboost", "catboost", "lightgbm", "arima", "sarima")
+SUPPORTED_MODELS = ("logreg", "svm", "rf", "gru", "tft", "blitecast", "simcast", "xgboost", "catboost", "lightgbm", "arima", "sarima")
 FEATURE_VARIANTS = (
     "baseline",
     "interaction_fe",
@@ -83,6 +83,7 @@ FEATURE_VARIANT_DESCRIPTIONS = {
     "tomek_interaction_fe": "Interaction features plus Tomek Links on the training split only.",
     "tomek_temporal_fe": "Temporal features plus Tomek Links on the training split only.",
     "tomek_interaction_temporal_fe": "Interaction features, temporal features, and Tomek Links on the training split only.",
+    "baseline_sequence": "Year-aware sequence baseline matching the notebook deep-learning path.",
 }
 FEATURE_COLUMNS = [
     "day",
@@ -140,14 +141,7 @@ FORMULA_DERIVED_FEATURE_COLUMNS = {
     "precipitation_t_gt_10",
     "t_gt_10",
 }
-LOGREG_SOLVER_PENALTIES = {
-    "lbfgs_l2": {"solver": "lbfgs", "penalty": "l2"},
-    "liblinear_l1": {"solver": "liblinear", "penalty": "l1"},
-    "liblinear_l2": {"solver": "liblinear", "penalty": "l2"},
-    "saga_l1": {"solver": "saga", "penalty": "l1"},
-    "saga_l2": {"solver": "saga", "penalty": "l2"},
-    "saga_elasticnet": {"solver": "saga", "penalty": "elasticnet"},
-}
+LOGREG_SOLVERS = ("liblinear", "lbfgs")
 
 
 @dataclass
@@ -178,7 +172,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizons", nargs="+", type=int, default=[2], help="Forecast horizons, e.g. --horizons 2 3")
     parser.add_argument("--window-sizes", nargs="+", type=int, default=[7], help="Window sizes, e.g. --window-sizes 5 7 9")
     parser.add_argument("--top-n", type=int, default=1, help="Keep only N best results per model ranked by the notebook rule.")
-    parser.add_argument("--tune-trials", type=int, default=0, help="Number of Optuna trials per tunable experiment.")
+    parser.add_argument("--tune-trials", type=int, default=10, help="Number of Optuna trials per tunable experiment.")
     parser.add_argument("--min-precision", type=float, default=MIN_PRECISION, help="Minimum precision floor used for threshold tuning and ranking.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Output root directory.")
     parser.add_argument("--upload-dataset", action="store_true", help="Upload zips to a Kaggle Dataset after each experiment.")
@@ -562,9 +556,6 @@ def add_variant_features(df: pd.DataFrame, window_size: int, variant: str, no_y:
             )
             work[trend_col] = current_mean - previous_mean
             feature_cols.append(trend_col)
-        work, accumulation_cols = add_accumulation_features(work)
-        feature_cols.extend(accumulation_cols)
-
     feature_cols = list(dict.fromkeys(feature_cols))
     if no_y:
         feature_cols = filter_y_feature_columns(feature_cols)
@@ -660,32 +651,21 @@ def choose_models(raw_models: list[str]) -> list[str]:
 
 def normalize_logreg_params(params: dict[str, Any] | None = None) -> dict[str, Any]:
     params = dict(params or {})
-    variant = params.pop("solver_penalty", None)
-    if variant:
-        params.update(LOGREG_SOLVER_PENALTIES[variant])
     params.setdefault("C", 1.0)
     params.setdefault("solver", "liblinear")
     params.setdefault("penalty", "l2")
-    params.setdefault("class_weight", "balanced")
-    params.setdefault("max_iter", 3000)
-    if params["solver"] == "saga" and params["penalty"] == "elasticnet":
-        params.setdefault("l1_ratio", 0.5)
-    else:
-        params.pop("l1_ratio", None)
+    params.setdefault("class_weight", None)
+    params.setdefault("max_iter", 1000)
+    params.pop("l1_ratio", None)
     return params
 
 
 def suggest_logreg_params(trial: Any) -> dict[str, Any]:
-    variant = trial.suggest_categorical("solver_penalty", list(LOGREG_SOLVER_PENALTIES))
-    params = {
-        "solver_penalty": variant,
-        "C": trial.suggest_float("C", 1e-3, 30.0, log=True),
+    return normalize_logreg_params({
+        "C": trial.suggest_float("C", 1e-3, 10.0, log=True),
+        "solver": trial.suggest_categorical("solver", list(LOGREG_SOLVERS)),
         "class_weight": trial.suggest_categorical("class_weight", [None, "balanced"]),
-        "max_iter": 3000,
-    }
-    if variant == "saga_elasticnet":
-        params["l1_ratio"] = trial.suggest_float("l1_ratio", 0.05, 0.95)
-    return normalize_logreg_params(params)
+    })
 
 
 def build_estimator(model: str, params: dict[str, Any] | None = None) -> Any:
@@ -930,33 +910,72 @@ def run_arima_like(train_df: pd.DataFrame, test_df: pd.DataFrame, target_col: st
     return y_true, y_pred, y_score, {"note": "ARIMA-style rolling target-rate baseline from notebook time-series family"}
 
 
-def blitecast_scores(frame: pd.DataFrame) -> np.ndarray:
-    aligned = frame.sort_values(["year", "day"])
-    precipitation = aligned.get("precipitation", pd.Series(0, index=aligned.index)).fillna(0)
-    t_avg = aligned.get("t_avg", pd.Series(0, index=aligned.index)).fillna(0)
-    cloudiness = aligned.get("cloudiness", pd.Series(0, index=aligned.index)).fillna(0)
-    return (
-        0.45 * (precipitation > 0).astype(float)
-        + 0.30 * t_avg.between(12, 20).astype(float)
-        + 0.25 * (cloudiness >= 6).astype(float)
-    ).to_numpy()
+def blitecast_daily_score(frame: pd.DataFrame) -> pd.Series:
+    rain_signal = ((frame["is_rain"] > 0) | (frame["precipitation"] >= 0.1)).astype(int)
+    score = pd.Series(0.0, index=frame.index)
+    score += np.where(frame["t_avg"].between(10, 24), 2.0, 0.0)
+    score += np.where(frame["t_avg"].between(7, 10, inclusive="left") | frame["t_avg"].between(24, 27, inclusive="right"), 1.0, 0.0)
+    score += rain_signal * 1.0
+    score += np.where(frame["cloudiness"] >= 6, 1.0, 0.0)
+    return score.clip(0, 4)
 
+
+def simcast_daily_score(frame: pd.DataFrame) -> pd.Series:
+    rain_signal = ((frame["is_rain"] > 0) | (frame["precipitation"] >= 0.1)).astype(int)
+    score = pd.Series(0.0, index=frame.index)
+    score += rain_signal * 2.0
+    score += np.where(frame["t_avg"].between(10, 23), 2.0, 0.0)
+    score += np.where(frame["t_min"] >= 10, 1.0, 0.0)
+    score += np.where(frame["cloudiness"] >= 6, 1.0, 0.0)
+    return score.clip(0, 6)
+
+
+def rule_based_payload(frame: pd.DataFrame, target_col: str, window_size: int, model: str) -> tuple[pd.Series, np.ndarray, pd.DataFrame]:
+    work = frame.copy().sort_values(["year", "day"]).reset_index(drop=True)
+    work["rule_score_daily"] = blitecast_daily_score(work) if model == "blitecast" else simcast_daily_score(work)
+    work["rule_score"] = (
+        work.groupby("year")["rule_score_daily"]
+        .rolling(window_size, min_periods=window_size)
+        .sum()
+        .reset_index(level=0, drop=True)
+    )
+    subset = work[["year", "day", target_col, "rule_score"]].dropna().reset_index(drop=True)
+    return subset[target_col].astype(int), subset["rule_score"].to_numpy(dtype=float), subset[["year", "day"]]
+
+
+
+def build_year_sequences(
+    frame: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    window_size: int,
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    x_list, y_list, meta_rows = [], [], []
+    for year, group in frame.sort_values(["year", "day"]).groupby("year", sort=False):
+        group = group.reset_index(drop=True)
+        x_values = group[feature_cols].to_numpy(dtype="float32")
+        y_values = group[target_col].to_numpy(dtype="float32")
+        for idx in range(len(group) - window_size + 1):
+            x_seq = x_values[idx : idx + window_size]
+            y_value = y_values[idx + window_size - 1]
+            if np.isnan(x_seq).any() or pd.isna(y_value):
+                continue
+            x_list.append(x_seq)
+            y_list.append(float(y_value))
+            meta_rows.append({"year": int(year), "day": int(group["day"].iloc[idx + window_size - 1])})
+    return np.asarray(x_list, dtype="float32"), np.asarray(y_list, dtype="float32"), pd.DataFrame(meta_rows)
 
 
 def run_gru_classifier(
-    x_train: pd.DataFrame,
-    y_train: pd.Series,
-    x_val: pd.DataFrame,
-    y_val: pd.Series,
-    x_test: pd.DataFrame,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    window_size: int,
     epochs: int,
-) -> tuple[np.ndarray, np.ndarray, Any, dict[str, Any]]:
-    """Train a small real GRU classifier on tabular weather windows.
-
-    The source notebook used year-aware sequences.  This CLI keeps the first
-    version Kaggle-friendly by treating each engineered feature row as a
-    one-step sequence, while still using an actual torch.nn.GRU model.
-    """
+) -> tuple[pd.Series, pd.Series, np.ndarray, np.ndarray, pd.DataFrame, Any, dict[str, Any]]:
+    """Train the notebook-style year-aware GRU sequence classifier."""
     try:
         import torch
         from torch import nn
@@ -964,13 +983,17 @@ def run_gru_classifier(
     except ImportError as exc:
         raise ImportError("GRU requires torch. Install requirements.txt before running --models gru.") from exc
 
-    imputer = SimpleImputer(strategy="median")
     scaler = StandardScaler()
-    fit_x = pd.concat([x_train, x_val], ignore_index=True) if not x_val.empty else x_train
-    fit_y = pd.concat([y_train, y_val], ignore_index=True) if not y_val.empty else y_train
-    train_arr = scaler.fit_transform(imputer.fit_transform(fit_x)).astype("float32")
-    test_arr = scaler.transform(imputer.transform(x_test)).astype("float32")
-    y_arr = fit_y.to_numpy(dtype="float32")
+    x_train, y_train, _ = build_year_sequences(train_df, feature_cols, target_col, window_size)
+    x_val, y_val, _ = build_year_sequences(val_df, feature_cols, target_col, window_size)
+    x_test, y_test, meta_test = build_year_sequences(test_df, feature_cols, target_col, window_size)
+    if min(len(x_train), len(x_val), len(x_test)) == 0:
+        raise ValueError("One of the GRU sequence splits is empty.")
+    n_features = x_train.shape[-1]
+    scaler.fit(x_train.reshape(-1, n_features))
+    x_train = scaler.transform(x_train.reshape(-1, n_features)).reshape(x_train.shape).astype("float32")
+    x_val = scaler.transform(x_val.reshape(-1, n_features)).reshape(x_val.shape).astype("float32")
+    x_test = scaler.transform(x_test.reshape(-1, n_features)).reshape(x_test.shape).astype("float32")
 
     torch.manual_seed(RANDOM_STATE)
 
@@ -981,13 +1004,15 @@ def run_gru_classifier(
             self.head = nn.Linear(16, 1)
 
         def forward(self, features):
-            _, hidden = self.gru(features.unsqueeze(1))
+            _, hidden = self.gru(features)
             return self.head(hidden[-1]).squeeze(1)
 
-    model = GRUClassifier(train_arr.shape[1])
+    model = GRUClassifier(x_train.shape[-1])
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    loss_fn = nn.BCEWithLogitsLoss()
-    ds = TensorDataset(torch.tensor(train_arr), torch.tensor(y_arr))
+    positives = max(1.0, float(y_train.sum()))
+    negatives = max(1.0, float(len(y_train) - y_train.sum()))
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([negatives / positives], dtype=torch.float32))
+    ds = TensorDataset(torch.tensor(x_train), torch.tensor(y_train))
     loader = DataLoader(ds, batch_size=min(64, max(1, len(ds))), shuffle=True)
     model.train()
     for _ in range(max(3, int(epochs) if epochs > 0 else 5)):
@@ -998,10 +1023,90 @@ def run_gru_classifier(
             optimizer.step()
     model.eval()
     with torch.no_grad():
-        logits = model(torch.tensor(test_arr))
-        y_score = torch.sigmoid(logits).cpu().numpy().astype(float)
-    y_pred = (y_score >= 0.5).astype(int)
-    return y_pred, y_score, model, {"epochs": max(3, int(epochs) if epochs > 0 else 5), "hidden_size": 16}
+        val_score = torch.sigmoid(model(torch.tensor(x_val))).cpu().numpy().astype(float)
+        test_score = torch.sigmoid(model(torch.tensor(x_test))).cpu().numpy().astype(float)
+    return pd.Series(y_val.astype(int)), pd.Series(y_test.astype(int)), val_score, test_score, meta_test, model, {
+        "epochs": max(3, int(epochs) if epochs > 0 else 5),
+        "hidden_size": 16,
+        "sequence_window": window_size,
+    }
+
+
+def tft_labels(frame: pd.DataFrame, target_col: str, window_size: int) -> tuple[pd.Series, pd.DataFrame]:
+    y_values, meta_rows = [], []
+    for year, group in frame.sort_values(["year", "day"]).groupby("year", sort=False):
+        group = group.reset_index(drop=True)
+        for idx in range(window_size, len(group)):
+            y_values.append(int(group[target_col].iloc[idx]))
+            meta_rows.append({"year": int(year), "day": int(group["day"].iloc[idx])})
+    return pd.Series(y_values, dtype=int), pd.DataFrame(meta_rows)
+
+
+def run_tft_classifier(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    window_size: int,
+    epochs: int,
+) -> tuple[pd.Series, pd.Series, np.ndarray, np.ndarray, pd.DataFrame, Any, dict[str, Any]]:
+    try:
+        import torch
+        import lightning.pytorch as pl
+        from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
+        from pytorch_forecasting.data import NaNLabelEncoder
+        from pytorch_forecasting.metrics import CrossEntropy
+    except Exception as exc:
+        raise ImportError("TFT requires pytorch-forecasting and lightning from requirements.txt.") from exc
+
+    frames = {}
+    for name, frame in {"train": train_df, "val": val_df, "test": test_df}.items():
+        work = frame.copy().sort_values(["year", "day"]).reset_index(drop=True)
+        work["series_id"] = work["year"].astype(str)
+        work["time_idx"] = work.groupby("year").cumcount()
+        work[target_col] = work[target_col].astype(int).astype(str)
+        frames[name] = work
+
+    training = TimeSeriesDataSet(
+        frames["train"],
+        time_idx="time_idx",
+        target=target_col,
+        group_ids=["series_id"],
+        max_encoder_length=window_size,
+        min_encoder_length=window_size,
+        max_prediction_length=1,
+        min_prediction_length=1,
+        time_varying_known_reals=["time_idx", *feature_cols],
+        target_normalizer=NaNLabelEncoder(),
+        allow_missing_timesteps=True,
+        randomize_length=False,
+    )
+    validation = TimeSeriesDataSet.from_dataset(training, frames["val"], stop_randomization=True, predict=False)
+    testing = TimeSeriesDataSet.from_dataset(training, frames["test"], stop_randomization=True, predict=False)
+    train_loader = training.to_dataloader(train=True, batch_size=64, num_workers=0)
+    val_loader = validation.to_dataloader(train=False, batch_size=128, num_workers=0)
+    test_loader = testing.to_dataloader(train=False, batch_size=128, num_workers=0)
+    params = {"hidden_size": 16, "attention_head_size": 1, "dropout": 0.1, "hidden_continuous_size": 8, "learning_rate": 1e-3}
+    model = TemporalFusionTransformer.from_dataset(training, loss=CrossEntropy(), output_size=2, **params)
+    trainer = pl.Trainer(max_epochs=max(3, int(epochs) if epochs > 0 else 5), logger=False, enable_checkpointing=False, enable_model_summary=False, num_sanity_val_steps=0)
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
+    def positive_scores(loader) -> np.ndarray:
+        raw = model.predict(loader, mode="raw")
+        pred = raw.output.prediction if hasattr(raw, "output") else raw
+        tensor = torch.as_tensor(pred)
+        if tensor.ndim == 3:
+            tensor = tensor[:, -1, :]
+        return torch.softmax(tensor, dim=1)[:, 1].detach().cpu().numpy()
+
+    y_val, _ = tft_labels(frames["val"], target_col, window_size)
+    y_test, meta_test = tft_labels(frames["test"], target_col, window_size)
+    val_score = positive_scores(val_loader)
+    test_score = positive_scores(test_loader)
+    usable_val = min(len(y_val), len(val_score))
+    usable_test = min(len(y_test), len(test_score), len(meta_test))
+    return y_val.iloc[:usable_val], y_test.iloc[:usable_test], val_score[:usable_val], test_score[:usable_test], meta_test.iloc[:usable_test], model, params
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1267,55 +1372,38 @@ def run_one(
         print(f"SKIP {model} variant={variant} h{horizon} w{window_size}: empty train/test split")
         return None
 
-    if model in {"gru", "tft"}:
-        result_dir = safe_folder_name(args.output_dir, model, 0.0, variant, oracle=args.oracle)
-        result_dir.mkdir(parents=True, exist_ok=True)
-        reason = (
-            "gru skipped: GRU training requires the PyTorch sequence-model path from the notebook; "
-            "no artificial fallback was created."
-            if model == "gru"
-            else "tft skipped: Temporal Fusion Transformer requires pytorch-forecasting/lightning and GPU-oriented setup; "
-            "no artificial fallback was created."
-        )
-        (result_dir / "skipped_model.txt").write_text(reason + "\n", encoding="utf-8")
-        write_config(
-            result_dir / "config_used.yaml",
-            (
-                run_config_args(args)
-                | {
-                    "model": model,
-                    "variant": variant,
-                    "horizon": horizon,
-                    "window_size": window_size,
-                }
-            )
-            | (
-                {
-                    "oracle": True,
-                    "oracle_horizon": horizon,
-                    "explanation": ORACLE_EXPLANATION,
-                    "oracle_feature_columns": oracle_feature_cols,
-                }
-                if args.oracle
-                else {}
-            ),
-        )
-        zip_path = zip_result(result_dir, args.output_dir)
-        maybe_upload(zip_path, args.output_dir, args.upload_dataset, args.dataset_slug)
-        return ExperimentResult(model, variant, horizon, window_size, 0.0, 0.0, 0.0, float("nan"), float("nan"), result_dir, zip_path)
-
-    x_train, y_train = train_df[feature_cols], train_df[target_col].astype(int)
-    x_val, y_val = val_df[feature_cols], val_df[target_col].astype(int)
-    x_test, y_test = test_df[feature_cols], test_df[target_col].astype(int)
-    tomek_note = None
-    if model not in {"arima", "sarima"}:
-        x_train, y_train, tomek_note = apply_tomek_if_needed(x_train, y_train, variant)
-
+    prediction_meta = test_df[["year", "day"]].copy().reset_index(drop=True)
     best_params: dict[str, Any] = {}
     selected_threshold: float | None = None
     threshold_info: dict[str, float] = {}
     val_metric_values: dict[str, float] = {}
-    if model in {"logreg", "svm", "rf", "xgboost", "catboost", "lightgbm"}:
+
+    if model in {"gru", "tft"}:
+        if variant != "baseline":
+            return None
+        runner = run_gru_classifier if model == "gru" else run_tft_classifier
+        y_val, y_test, val_score, y_score, prediction_meta, estimator, best_params = runner(
+            train_df, val_df, test_df, feature_cols, target_col, window_size, args.tune_trials
+        )
+        threshold_info = search_threshold(y_val.to_numpy(dtype=int), val_score, args.min_precision)
+        selected_threshold = threshold_info["threshold"]
+        y_pred = (np.asarray(y_score, dtype=float) >= selected_threshold).astype(int)
+        val_metric_values = validation_metrics(y_val, val_score, selected_threshold)
+        variant = "baseline_sequence"
+    else:
+        estimator = None
+
+    tomek_note = None
+    if model not in {"gru", "tft"}:
+        x_train, y_train = train_df[feature_cols], train_df[target_col].astype(int)
+        x_val, y_val = val_df[feature_cols], val_df[target_col].astype(int)
+        x_test, y_test = test_df[feature_cols], test_df[target_col].astype(int)
+        if model not in {"arima", "sarima"}:
+            x_train, y_train, tomek_note = apply_tomek_if_needed(x_train, y_train, variant)
+
+    if model in {"gru", "tft"}:
+        pass
+    elif model in {"logreg", "svm", "rf", "xgboost", "catboost", "lightgbm"}:
         best_params = tune_params(model, x_train, y_train, x_val, y_val, args.tune_trials, args.min_precision)
         estimator = build_estimator(model, best_params)
         if model in {"xgboost", "catboost", "lightgbm"}:
@@ -1375,19 +1463,13 @@ def run_one(
                         "val_f1": threshold_info["f1"],
                         "val_accuracy": float(accuracy_score(y_val, val_pred)),
                     }
-    elif model == "blitecast":
-        aligned = test_df.sort_values(["year", "day"])
-        val_score = blitecast_scores(val_df) if not val_df.empty else None
-        y_score = blitecast_scores(aligned)
-        if val_score is not None:
-            threshold_info = search_threshold(val_df[target_col].astype(int).to_numpy(), val_score, args.min_precision)
-            selected_threshold = threshold_info["threshold"]
-            val_metric_values = validation_metrics(val_df[target_col].astype(int), val_score, selected_threshold)
-        else:
-            selected_threshold = 0.5
+    elif model in {"blitecast", "simcast"}:
+        y_val_rule, val_score, _ = rule_based_payload(val_df, target_col, window_size, model)
+        y_test, y_score, prediction_meta = rule_based_payload(test_df, target_col, window_size, model)
+        threshold_info = search_threshold(y_val_rule.to_numpy(dtype=int), val_score, args.min_precision)
+        selected_threshold = threshold_info["threshold"]
+        val_metric_values = validation_metrics(y_val_rule, val_score, selected_threshold)
         y_pred = (y_score >= selected_threshold).astype(int)
-        y_test = aligned[target_col].astype(int)
-        estimator = None
     elif model in {"arima", "sarima"}:
         if not val_df.empty:
             _, _, val_score, _ = run_arima_like(train_df, val_df, target_col)
@@ -1481,7 +1563,7 @@ def run_one(
             json.dumps(threshold_payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-    pred_rows = test_df[["year", "day"]].copy().reset_index(drop=True)
+    pred_rows = prediction_meta.copy().reset_index(drop=True)
     pred_rows["y_true"] = np.asarray(y_test, dtype=int)
     pred_rows["y_pred_binary"] = np.asarray(y_pred, dtype=int)
     if y_score is not None:

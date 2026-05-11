@@ -40,14 +40,7 @@ MODEL_ALIASES = {
 }
 
 TRANSFERRED_MODEL_NAMES = ("xgboost", "catboost", "lightgbm", "arima", "sarima")
-LOGREG_SOLVER_PENALTIES = {
-    "lbfgs_l2": {"solver": "lbfgs", "penalty": "l2"},
-    "liblinear_l1": {"solver": "liblinear", "penalty": "l1"},
-    "liblinear_l2": {"solver": "liblinear", "penalty": "l2"},
-    "saga_l1": {"solver": "saga", "penalty": "l1"},
-    "saga_l2": {"solver": "saga", "penalty": "l2"},
-    "saga_elasticnet": {"solver": "saga", "penalty": "elasticnet"},
-}
+LOGREG_SOLVERS = ("liblinear", "lbfgs")
 
 
 def normalize_model_name(model_name: str) -> str:
@@ -96,32 +89,21 @@ def sanitize_xy(X: pd.DataFrame, y: Iterable[int]) -> Tuple[pd.DataFrame, pd.Ser
 
 def normalize_logreg_params(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     params = dict(params or {})
-    variant = params.pop("solver_penalty", None)
-    if variant:
-        params.update(LOGREG_SOLVER_PENALTIES[variant])
     params.setdefault("C", 1.0)
     params.setdefault("solver", "liblinear")
     params.setdefault("penalty", "l2")
     params.setdefault("class_weight", None)
-    params.setdefault("max_iter", 3000)
-    if params["solver"] == "saga" and params["penalty"] == "elasticnet":
-        params.setdefault("l1_ratio", 0.5)
-    else:
-        params.pop("l1_ratio", None)
+    params.setdefault("max_iter", 1000)
+    params.pop("l1_ratio", None)
     return params
 
 
 def suggest_logreg_params(trial) -> Dict[str, Any]:
-    variant = trial.suggest_categorical("solver_penalty", list(LOGREG_SOLVER_PENALTIES))
-    params: Dict[str, Any] = {
-        "solver_penalty": variant,
-        "C": trial.suggest_float("C", 1e-3, 30.0, log=True),
+    return normalize_logreg_params({
+        "C": trial.suggest_float("C", 1e-3, 10.0, log=True),
+        "solver": trial.suggest_categorical("solver", list(LOGREG_SOLVERS)),
         "class_weight": trial.suggest_categorical("class_weight", [None, "balanced"]),
-        "max_iter": 3000,
-    }
-    if variant == "saga_elasticnet":
-        params["l1_ratio"] = trial.suggest_float("l1_ratio", 0.05, 0.95)
-    return normalize_logreg_params(params)
+    })
 
 
 def build_logreg(params: Optional[Dict[str, Any]] = None):

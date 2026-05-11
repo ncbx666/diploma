@@ -1132,6 +1132,50 @@ def tft_labels(frame: pd.DataFrame, target_col: str, window_size: int) -> tuple[
     return pd.Series(y_values, dtype=int), pd.DataFrame(meta_rows)
 
 
+def tft_prediction_to_tensor(prediction: Any):
+    import torch
+
+    if torch.is_tensor(prediction):
+        return prediction
+    if isinstance(prediction, np.ndarray):
+        return torch.as_tensor(prediction)
+    if isinstance(prediction, dict):
+        for key in ("prediction", "output"):
+            if key in prediction:
+                return tft_prediction_to_tensor(prediction[key])
+    if hasattr(prediction, "prediction"):
+        return tft_prediction_to_tensor(prediction.prediction)
+    if hasattr(prediction, "output"):
+        return tft_prediction_to_tensor(prediction.output)
+    if isinstance(prediction, (list, tuple)):
+        tensors = [tft_prediction_to_tensor(item) for item in prediction]
+        tensors = [tensor for tensor in tensors if tensor is not None]
+        if not tensors:
+            raise ValueError("TFT prediction output did not contain tensors.")
+        if len(tensors) == 1:
+            return tensors[0]
+        try:
+            return torch.cat(tensors, dim=0)
+        except RuntimeError:
+            return torch.stack([tensor.squeeze() for tensor in tensors], dim=0)
+    return torch.as_tensor(prediction)
+
+
+def tft_positive_class_scores(raw_prediction: Any) -> np.ndarray:
+    import torch
+
+    tensor = tft_prediction_to_tensor(raw_prediction).detach().float()
+    if tensor.ndim == 3:
+        tensor = tensor[:, -1, :]
+    elif tensor.ndim > 3:
+        tensor = tensor.reshape(tensor.shape[0], -1, tensor.shape[-1])[:, -1, :]
+    if tensor.ndim == 2 and tensor.shape[1] > 1:
+        scores = torch.softmax(tensor, dim=1)[:, 1]
+    else:
+        scores = torch.sigmoid(tensor.reshape(-1))
+    return scores.cpu().numpy().astype(float)
+
+
 def run_tft_classifier(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -1179,16 +1223,20 @@ def run_tft_classifier(
     test_loader = testing.to_dataloader(train=False, batch_size=128, num_workers=0)
     params = {"hidden_size": 16, "attention_head_size": 1, "dropout": 0.1, "hidden_continuous_size": 8, "learning_rate": 1e-3}
     model = TemporalFusionTransformer.from_dataset(training, loss=CrossEntropy(), output_size=2, **params)
-    trainer = pl.Trainer(max_epochs=max(3, int(epochs) if epochs > 0 else 5), logger=False, enable_checkpointing=False, enable_model_summary=False, num_sanity_val_steps=0)
+    trainer = pl.Trainer(
+        max_epochs=max(3, int(epochs) if epochs > 0 else 5),
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        num_sanity_val_steps=0,
+    )
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
     def positive_scores(loader) -> np.ndarray:
         raw = model.predict(loader, mode="raw")
-        pred = raw.output.prediction if hasattr(raw, "output") else raw
-        tensor = torch.as_tensor(pred)
-        if tensor.ndim == 3:
-            tensor = tensor[:, -1, :]
-        return torch.softmax(tensor, dim=1)[:, 1].detach().cpu().numpy()
+        return tft_positive_class_scores(raw)
 
     y_val, _ = tft_labels(frames["val"], target_col, window_size)
     y_test, meta_test = tft_labels(frames["test"], target_col, window_size)

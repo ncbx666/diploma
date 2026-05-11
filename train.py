@@ -1829,6 +1829,7 @@ def main() -> int:
         raise ValueError("--min-precision must be between 0 and 1.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     models = choose_models(args.models)
+    print(f"Selected models: {models}")
     data_path = find_data_file(args.data)
     df = add_targets(load_dataset(data_path), args.horizons)
     if args.oracle:

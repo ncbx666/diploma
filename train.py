@@ -934,18 +934,70 @@ def predict_scores(estimator: Any, x_test: pd.DataFrame) -> np.ndarray | None:
     return None
 
 
-def run_arima_like(train_df: pd.DataFrame, test_df: pd.DataFrame, target_col: str) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict[str, Any]]:
-    # Conservative ARIMA-style baseline: use recent target rolling mean by year, no artificial dependency fallback.
-    # If statsmodels is installed, users can extend this without changing the train.py contract.
-    history_rate = float(train_df[target_col].mean()) if len(train_df) else 0.5
-    scores = []
-    for _, group in test_df.sort_values(["year", "day"]).groupby("year"):
-        rolling = group[target_col].shift(1).expanding(min_periods=1).mean().fillna(history_rate)
-        scores.extend(rolling.to_numpy(dtype=float).tolist())
-    y_true = test_df.sort_values(["year", "day"])[target_col].astype(int).to_numpy()
-    y_score = np.asarray(scores, dtype=float)
-    y_pred = (y_score >= 0.5).astype(int)
-    return y_true, y_pred, y_score, {"note": "ARIMA-style rolling target-rate baseline from notebook time-series family"}
+def arima_default_params(model: str) -> dict[str, Any]:
+    if model == "arima":
+        return {
+            "order": (1, 0, 0),
+            "seasonal_order": (0, 0, 0, 0),
+            "inference": "leakage-free train-history forecast",
+        }
+    if model == "sarima":
+        return {
+            "order": (1, 0, 0),
+            "seasonal_order": (1, 0, 0, 7),
+            "inference": "leakage-free train-history forecast",
+        }
+    raise ValueError(model)
+
+
+def forecast_arima_scores(train_y: pd.Series, steps: int, model: str) -> tuple[np.ndarray, dict[str, Any]]:
+    params = arima_default_params(model)
+    if steps <= 0:
+        return np.array([], dtype=float), params
+    history = pd.Series(train_y).dropna().astype(float).reset_index(drop=True)
+    fallback_rate = float(history.mean()) if len(history) else 0.5
+    try:
+        estimator = build_transferred_model(model, params)
+        estimator.fit(history)
+        scores = estimator.predict_score(steps=steps)
+        params["fit_status"] = "statsmodels"
+    except Exception as exc:
+        scores = np.full(steps, fallback_rate, dtype=float)
+        params["fit_status"] = "fallback_train_mean"
+        params["fallback_error"] = f"{type(exc).__name__}: {exc}"
+    scores = np.asarray(scores, dtype=float).reshape(-1)
+    if scores.size != steps:
+        scores = np.resize(scores, steps)
+        params["score_resize_note"] = f"resized forecast to {steps} steps"
+    scores = np.nan_to_num(scores, nan=fallback_rate, posinf=1.0, neginf=0.0)
+    return np.clip(scores, 0.0, 1.0), params
+
+
+def run_arima_sarima_forecast(
+    model: str,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    target_col: str,
+) -> tuple[pd.Series, pd.Series, np.ndarray, np.ndarray, dict[str, Any]]:
+    train_sorted = train_df.sort_values(["year", "day"]).reset_index(drop=True)
+    val_sorted = val_df.sort_values(["year", "day"]).reset_index(drop=True)
+    test_sorted = test_df.sort_values(["year", "day"]).reset_index(drop=True)
+
+    total_steps = len(val_sorted) + len(test_sorted)
+    all_scores, params = forecast_arima_scores(train_sorted[target_col], total_steps, model)
+    val_score = all_scores[: len(val_sorted)]
+    test_score = all_scores[len(val_sorted) :]
+    params["validation_steps"] = len(val_sorted)
+    params["test_steps"] = len(test_sorted)
+    params["target_used_for_score"] = "train split only"
+    return (
+        val_sorted[target_col].astype(int),
+        test_sorted[target_col].astype(int),
+        val_score,
+        test_score,
+        params,
+    )
 
 
 def blitecast_daily_score(frame: pd.DataFrame) -> pd.Series:
@@ -1509,22 +1561,13 @@ def run_one(
         val_metric_values = validation_metrics(y_val_rule, val_score, selected_threshold)
         y_pred = (y_score >= selected_threshold).astype(int)
     elif model in {"arima", "sarima"}:
-        if not val_df.empty:
-            _, _, val_score, _ = run_arima_like(train_df, val_df, target_col)
-            if val_score is not None:
-                threshold_info = search_threshold(val_df.sort_values(["year", "day"])[target_col].astype(int).to_numpy(), val_score, args.min_precision)
-                selected_threshold = threshold_info["threshold"]
-                val_metric_values = validation_metrics(
-                    val_df.sort_values(["year", "day"])[target_col].astype(int),
-                    val_score,
-                    selected_threshold,
-                )
-        y_true_arima, y_pred, y_score, best_params = run_arima_like(pd.concat([train_df, val_df]), test_df, target_col)
-        if model == "sarima":
-            best_params["seasonal_note"] = "SARIMA-compatible baseline; full statsmodels SARIMAX is available through src.models when statsmodels is installed"
-        y_test = pd.Series(y_true_arima)
-        if selected_threshold is not None and y_score is not None:
-            y_pred = (np.asarray(y_score, dtype=float) >= selected_threshold).astype(int)
+        y_val_arima, y_test, val_score, y_score, best_params = run_arima_sarima_forecast(
+            model, train_df, val_df, test_df, target_col
+        )
+        threshold_info = search_threshold(y_val_arima.to_numpy(dtype=int), val_score, args.min_precision)
+        selected_threshold = threshold_info["threshold"]
+        val_metric_values = validation_metrics(y_val_arima, val_score, selected_threshold)
+        y_pred = (np.asarray(y_score, dtype=float) >= selected_threshold).astype(int)
         estimator = None
     else:
         raise ValueError(model)

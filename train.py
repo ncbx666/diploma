@@ -8,9 +8,11 @@ and artifacts, then immediately zip each experiment result folder.
 from __future__ import annotations
 
 import argparse
+import calendar
 import csv
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -223,9 +225,32 @@ def clean_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(text, errors="coerce")
 
 
+YEAR_SHEET_PATTERN = re.compile(r"^G?\d{4}$")
+
+
+def canonical_day_sequence(year: int) -> np.ndarray:
+    start_day = 153 if calendar.isleap(int(year)) else 152
+    return np.arange(start_day, start_day + 92, dtype=int)
+
+
+def is_valid_day_sequence(year: int, day_values: pd.Series) -> bool:
+    if day_values.isna().any() or len(day_values) != 92:
+        return False
+    try:
+        observed = day_values.astype(int).to_numpy()
+    except ValueError:
+        return False
+    return (
+        np.all(np.diff(observed) == 1)
+        and observed[0] in {152, 153}
+        and observed[-1] == observed[0] + 91
+    )
+
+
 def load_dataset(excel_path: Path) -> pd.DataFrame:
-    book = pd.ExcelFile(excel_path, engine="openpyxl")
-    year_sheets = [s for s in book.sheet_names if any(ch.isdigit() for ch in s) and len("".join(filter(str.isdigit, s))) == 4]
+    with pd.ExcelFile(excel_path, engine="openpyxl") as book:
+        sheet_names = list(book.sheet_names)
+    year_sheets = [s for s in sheet_names if YEAR_SHEET_PATTERN.fullmatch(str(s))]
     frames: list[pd.DataFrame] = []
     if year_sheets:
         positional = [
@@ -234,11 +259,24 @@ def load_dataset(excel_path: Path) -> pd.DataFrame:
             "y3", "y4", "precipitation_t_gt_10", "t_gt_10",
         ]
         for sheet in year_sheets:
-            year = int("".join(filter(str.isdigit, sheet)))
+            year = int(re.search(r"(\d{4})", str(sheet)).group(1))
             raw = pd.read_excel(excel_path, sheet_name=sheet, engine="openpyxl", nrows=92)
-            raw = raw.iloc[:, : len(positional)].copy()
-            raw.columns = positional[: raw.shape[1]]
+            rename_map = {
+                original_col: positional[idx]
+                for idx, original_col in enumerate(raw.columns[: len(positional)])
+            }
+            raw = raw.rename(columns=rename_map)
+            for column in positional:
+                if column not in raw.columns:
+                    raw[column] = np.nan
+            raw = raw[positional].copy()
             raw["year"] = year
+            for column in [col for col in positional if col != "year"]:
+                raw[column] = clean_numeric(raw[column])
+            if is_valid_day_sequence(year, raw["day"]):
+                raw["day"] = raw["day"].astype(int)
+            else:
+                raw["day"] = canonical_day_sequence(year)
             frames.append(raw)
     else:
         raw = pd.read_excel(excel_path, engine="openpyxl")

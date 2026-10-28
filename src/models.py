@@ -385,43 +385,10 @@ def suggest_params(trial, model_name: str, y_train: Iterable[int]) -> Dict[str, 
         return params
     raise ValueError(f"No transferred Optuna search space for model '{model_name}'")
 
-# Compatibility helpers for the simple worker-2 training orchestrator.
-@dataclass
-class ModelResult:
-    model: Any | None
-    y_score: Optional[np.ndarray]
-    y_pred_binary: np.ndarray
-
-
-def fit_predict_sklearn(model_name: str, X_train, y_train, X_test, random_state: int = RANDOM_STATE) -> ModelResult:
-    model = build_model(model_name, y_train=y_train)
-    fit_estimator(model_name, model, X_train, y_train)
-    scores = predict_scores(model_name, model, X_test)
-    y_pred = predict_binary(model_name, model, X_test)
-    return ModelResult(model=model, y_score=scores, y_pred_binary=y_pred)
-
-
-def predict_blitecast(frame: pd.DataFrame) -> ModelResult:
-    precipitation = frame.get("precipitation", pd.Series(0, index=frame.index)).fillna(0)
-    t_avg = frame.get("t_avg", pd.Series(0, index=frame.index)).fillna(0)
-    cloudiness = frame.get("cloudiness", pd.Series(0, index=frame.index)).fillna(0)
-    score = (
-        0.45 * (precipitation > 0).astype(float)
-        + 0.30 * t_avg.between(12, 20).astype(float)
-        + 0.25 * (cloudiness >= 6).astype(float)
-    ).to_numpy()
-    return ModelResult(model=None, y_score=score, y_pred_binary=(score >= 0.5).astype(int))
-
-
-def predict_sarima(train_y: pd.Series, test_len: int) -> ModelResult:
-    model = build_sarima()
-    model.fit(train_y)
-    score = model.predict_score(test_len)
-    return ModelResult(model=model, y_score=score, y_pred_binary=(score >= 0.5).astype(int))
 
 @dataclass
 class PredictionResult:
-    """Common prediction payload used by training.py."""
+    """Prediction payload returned by fit_predict_sklearn."""
 
     y_pred_binary: np.ndarray
     y_score: Optional[np.ndarray] = None
@@ -439,7 +406,7 @@ def fit_predict_sklearn(
     y_val: Optional[Iterable[int]] = None,
     random_state: int = RANDOM_STATE,
 ) -> PredictionResult:
-    """Backward-compatible helper for the simple training pipeline."""
+    """Fit, optionally tune the logreg threshold on validation, and predict."""
     name = normalize_model_name(model_name)
     params: Dict[str, Any] = {}
     if name == "rf":
@@ -468,34 +435,3 @@ def fit_predict_sklearn(
         validation_metrics=validation_metrics,
         threshold_objective=threshold_objective,
     )
-
-
-def predict_blitecast(frame: pd.DataFrame) -> PredictionResult:
-    """Simple notebook baseline: favorable if recent weather signals are high."""
-    if frame.empty:
-        return PredictionResult(y_pred_binary=np.array([], dtype=int), y_score=np.array([], dtype=float))
-    candidates = [col for col in ["target_favorable", "is_rain", "precipitation_t_gt_10", "t_gt_10"] if col in frame]
-    if not candidates:
-        scores = np.zeros(len(frame), dtype=float)
-    else:
-        numeric = frame[candidates].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-        max_values = numeric.max().replace(0, 1)
-        scores = (numeric / max_values).mean(axis=1).clip(0, 1).to_numpy(dtype=float)
-    return PredictionResult(y_pred_binary=(scores >= 0.5).astype(int), y_score=scores)
-
-
-def predict_sarima(y_train: Iterable[int], steps: int) -> PredictionResult:
-    """Compatibility wrapper for a SARIMA baseline without exogenous features."""
-    model = build_sarima({})
-    try:
-        model.fit(y_train)
-        scores = model.predict_score(steps=steps)
-    except ImportError:
-        raise
-    except Exception:
-        # Short or degenerate series can make SARIMAX fail; use the observed
-        # positive rate as a deterministic statistical fallback score.
-        y_series = pd.Series(y_train).astype(float)
-        rate = float(y_series.mean()) if len(y_series) else 0.0
-        scores = np.full(int(steps), np.clip(rate, 0.0, 1.0), dtype=float)
-    return PredictionResult(y_pred_binary=(scores >= 0.5).astype(int), y_score=scores)

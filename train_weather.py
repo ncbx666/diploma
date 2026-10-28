@@ -48,7 +48,7 @@ except Exception:  # pragma: no cover - artifact convenience only
 
 
 RANDOM_STATE = 42
-DEFAULT_DATA_FILE = "Golitcino72-17d2_CLEAN.xlsx"
+DEFAULT_DATA_FILE = "data/Golitcino72-17d2_CLEAN.xlsx"
 DEFAULT_OUTPUT_DIR = Path("/kaggle/working/weather_outputs")
 FORECAST_VARIABLES = ["t_min", "t_max", "t_avg", "precipitation", "is_rain", "cloudiness"]
 RAIN_TARGET = "is_rain"
@@ -147,7 +147,7 @@ def find_data_file(path_arg: str) -> Path:
         if candidate.exists():
             return candidate
     raise FileNotFoundError(
-        f"{requested.name} not found. Put it in the repo root, /kaggle/working, "
+        f"{requested.name} not found. Put it in data/, /kaggle/working, "
         "attach it as a Kaggle Dataset, or set DIPLOMA_EXCEL_FILE_PATH."
     )
 

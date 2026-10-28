@@ -65,7 +65,7 @@ RANDOM_STATE = 42
 MIN_PRECISION = 0.60
 VAL_YEAR_COUNT = 6
 TEST_YEAR_COUNT = 6
-DEFAULT_DATA_FILE = "Golitcino72-17d2_CLEAN.xlsx"
+DEFAULT_DATA_FILE = "data/Golitcino72-17d2_CLEAN.xlsx"
 DEFAULT_OUTPUT_DIR = Path("/kaggle/working/outputs")
 SUPPORTED_MODELS = ("logreg", "svm", "rf", "gru", "tft", "blitecast", "simcast", "xgboost", "catboost", "lightgbm", "arima", "sarima")
 TABULAR_WINDOW_MODELS = {"logreg", "svm", "rf", "xgboost", "catboost", "lightgbm"}
@@ -215,7 +215,7 @@ def find_data_file(path_arg: str) -> Path:
         if candidate.exists():
             return candidate
     raise FileNotFoundError(
-        f"{requested.name} not found. Put it in the repo root, /kaggle/working, "
+        f"{requested.name} not found. Put it in data/, /kaggle/working, "
         "attach it as a Kaggle Dataset, or set DIPLOMA_EXCEL_FILE_PATH."
     )
 

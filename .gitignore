@@ -2,3 +2,11 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Local environments and run outputs
+.venv/
+venv/
+.pytest_cache/
+outputs/
+weather_outputs/
+.DS_Store

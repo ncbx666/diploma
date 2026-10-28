@@ -1,240 +1,129 @@
-# Potato illness forecasting on Kaggle
+# Прогноз фитофтороза картофеля по погодным данным
 
-## Weather-only forecasting benchmark
+Код выпускной квалификационной работы: прогноз благоприятных для фитофтороза
+условий (`Target_Favorable`) на `h` дней вперёд по метеоданным за
+1972–2017 годы (датасет `Golitcino72-17d2`). Сравниваются классические модели, бустинги,
+нейросети и статистические бейзлайны.
 
-Use `train_weather.py` when you want a pure weather benchmark. It forecasts raw
-weather variables only:
+- Текст ВКР: [`docs/vkr-uglov.pdf`](docs/vkr-uglov.pdf)
+- Веб-сервис с обученными моделями: [diploma-web-ui](https://github.com/ncbx666/diploma-web-ui),
+  демо — https://diploma-web-ui.onrender.com/
 
-- `lead_1 = t+1`
-- `lead_2 = t+2`
-- targets: `t_min`, `t_max`, `t_avg`, `precipitation`, `is_rain`, `cloudiness`
+Скрипты рассчитаны на Kaggle (выходные файлы по умолчанию пишутся в
+`/kaggle/working`), но запускаются и локально.
 
-It does not train disease classifiers, does not predict `Target_Favorable`, and
-does not use disease-derived or formula-derived columns such as `y1`, `y2`,
-`y2_y1`, `y3`, `y4`, `precipitation_t_gt_10`, or `t_gt_10`.
+## Структура
 
-Install dependencies on Kaggle:
+```text
+train.py              # бенчмарк классификаторов болезни (основная точка входа)
+train_weather.py      # бенчмарк прогноза самих погодных переменных
+src/models.py         # фабрики моделей и пространства поиска Optuna
+src/evaluation.py     # метрики и подбор порога
+tests/                # unit-тесты подбора порога и logreg
+data/Golitcino72-17d2_CLEAN.xlsx   # исходный датасет
+docs/vkr-uglov.pdf    # текст ВКР
+```
+
+## Установка
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Fast smoke run:
+`requirements.txt` содержит все зависимости, включая тяжёлые (`torch`,
+`pytorch-forecasting`, `chronos-forecasting`). Если какой-то опциональной
+библиотеки нет, соответствующая модель пропускается, а в папку результата
+пишется `skipped_model.txt`.
+
+## Данные
+
+По умолчанию скрипты берут `data/Golitcino72-17d2_CLEAN.xlsx`. Файл ищется
+также в текущей папке, в `/kaggle/working`, в подключённых Kaggle Datasets
+(`/kaggle/input/**`) и по пути из `--data` или переменной
+`DIPLOMA_EXCEL_FILE_PATH`.
+
+Годы делятся по времени: последние 6 — тест, 6 перед ними — валидация,
+остальные — обучение.
+
+## Бенчмарк классификаторов: `train.py`
+
+Быстрая проверка, что всё работает:
 
 ```bash
-python train_weather.py \
-  --data Golitcino72-17d2_CLEAN.xlsx \
-  --models catboost_hybrid lightgbm_hybrid \
-  --window-sizes 7 \
-  --tune-trials 0 \
-  --output-dir /kaggle/working/weather_outputs
+python train.py --models svm --horizons 2 --window-sizes 7 --top-n 1 --tune-trials 0 --output-dir ./outputs
 ```
 
-Full weather benchmark:
-
-```bash
-python train_weather.py \
-  --data Golitcino72-17d2_CLEAN.xlsx \
-  --models catboost_hybrid lightgbm_hybrid chronos2 \
-  --window-sizes 7 11 \
-  --tune-trials 20 \
-  --output-dir /kaggle/working/weather_outputs
-```
-
-`catboost_hybrid` and `lightgbm_hybrid` train direct one-head-per-variable
-forecasters and blend them with a raw-weather persistence baseline using the
-validation split. `chronos2` uses Chronos-2 zero-shot inference from
-`chronos-forecasting>=2.0`; on Kaggle GPU runtimes it will download
-`amazon/chronos-2` from Hugging Face the first time it runs.
-
-Outputs are written under `/kaggle/working/weather_outputs` by default:
-
-- `summary_weather.csv` ranks model/window runs by weather-only metrics.
-- `metrics_weather_all.csv` contains per-lead, per-variable metrics.
-- each run folder contains `predictions.csv`, `metrics_weather.csv`,
-  `summary_weather.json`, `config_used.json`, and a zip under `zips/`.
-
-Regression weather targets are compared with MAE, RMSE, sMAPE, and R2.
-`is_rain` is compared with accuracy, F1, precision, recall, ROC AUC, and Brier
-score. The aggregate `weather_score_lower_is_better` is weather-only and combines
-sMAPE, Brier loss, and rain F1.
-
----
-
-This project turns the reference notebooks into a small Kaggle-friendly training
-script. The original notebooks are kept in the repository as references; the main
-entry point is `train.py`.
-
-## 1. Install dependencies
-
-In a Kaggle notebook or a fresh clone, run:
-
-```bash
-pip install -r requirements.txt
-```
-
-If `requirements.txt` is not present yet, install the core runtime manually:
-
-```bash
-pip install pandas numpy scikit-learn openpyxl matplotlib optuna
-```
-
-Optional model families need their own packages, for example `statsmodels` for a
-full ARIMA implementation and `pytorch-forecasting`/`lightning` for TFT. The
-script records skipped optional artifacts in `skipped_plots.txt` or
-`skipped_model.txt` instead of creating fake fallbacks.
-
-## 2. Put the Excel file in place
-
-The expected data file is:
-
-```text
-Golitcino72-17d2_CLEAN.xlsx
-```
-
-Supported locations:
-
-- repository root after cloning;
-- `/kaggle/working/Golitcino72-17d2_CLEAN.xlsx`;
-- any Kaggle input dataset path under `/kaggle/input/**/Golitcino72-17d2_CLEAN.xlsx`;
-- a custom path via `--data` or `DIPLOMA_EXCEL_FILE_PATH`.
-
-The script does **not** download the dataset from the internet automatically.
-
-## 3. Run one quick model
-
-```bash
-python train.py \
-  --data Golitcino72-17d2_CLEAN.xlsx \
-  --models svm \
-  --horizons 2 \
-  --window-sizes 7 \
-  --tune-trials 0
-```
-
-By default outputs go to:
-
-```text
-/kaggle/working/outputs
-```
-
-For a local test outside Kaggle, use `--output-dir ./outputs`.
-
-## 4. Run all supported models
+Полный прогон:
 
 ```bash
 python train.py --models all --horizons 2 3 --window-sizes 5 7 9 --top-n 2 --tune-trials 10
 ```
 
-Feature-engineering experiments from the reference notebooks are always run for
-each selected model/horizon/window combination. They are intentionally **not**
-CLI parameters, so the benchmark grid remains reproducible:
+Модели: `logreg`, `svm`, `rf`, `gru`, `tft`, `blitecast`, `xgboost`,
+`catboost`, `lightgbm`, `arima`, `sarima`; `all` запускает все.
 
-- `baseline`
-- `interaction_fe`
-- `temporal_fe`
-- `tomek_only`
-- `tomek_interaction_fe`
-- `tomek_temporal_fe`
-- `tomek_interaction_temporal_fe`
+Для каждой комбинации модель × горизонт × окно всегда прогоняются семь
+вариантов признаков: `baseline`, `interaction_fe`, `temporal_fe`,
+`tomek_only`, `tomek_interaction_fe`, `tomek_temporal_fe`,
+`tomek_interaction_temporal_fe` (ручные взаимодействия, лаги и скользящие
+статистики внутри года, Tomek Links только на обучающей выборке).
 
-The variants come from `notebook08038a32e2 (1).ipynb` and
-`potato_illness_forecasting_benchmark (2).ipynb`: manual interaction features,
-within-year lag/rolling/trend features, and Tomek Links on the training split
-only.
+Основные флаги:
 
-Supported model names in `train.py`:
+| Флаг | Что делает |
+|---|---|
+| `--models` | список моделей или `all` |
+| `--horizons` | горизонты прогноза в днях, например `2 3` |
+| `--window-sizes` | размеры окна признаков, например `5 7 9` |
+| `--top-n N` | оставить N лучших результатов на модель |
+| `--tune-trials N` | число итераций Optuna; `0` — без подбора |
+| `--min-precision` | минимальная precision при подборе порога и ранжировании (по умолчанию 0.60) |
+| `--no-y` | исключить `y1`–`y4` и производные от них признаки |
+| `--invert-classes` | инвертировать итоговые предсказания |
+| `--oracle`, `--predict_features` | подставлять фактическую погоду на `t+h` как «оракульные» признаки |
+| `--output-dir` | папка результатов, по умолчанию `/kaggle/working/outputs` |
+| `--upload-dataset`, `--dataset-slug` | сохранять zip-архивы в Kaggle Dataset |
 
-- `logreg`
-- `svm`
-- `rf`
-- `gru`
-- `tft`
-- `blitecast`
-- `xgboost`
-- `catboost`
-- `lightgbm`
-- `arima`
-- `sarima`
+Порог подбирается на валидации: среди порогов с precision ≥ `--min-precision`
+выбирается порог с наибольшим recall. Результаты ранжируются так же: сначала
+выполнение условия по precision, затем recall, PR AUC, F1 и ROC AUC.
 
-`all` expands to the full supported list. Optional models that require unavailable
-runtime packages are skipped with an explicit text artifact rather than a fake
-substitute.
+### Результаты
 
-## 5. Important CLI options
+Каждый эксперимент сохраняется в папку вида
+`<модель>_<вариант>_<F1 в процентах>_<окно>`, например
+`outputs/svm_tomek_temporal_fe_42_7/`, и сразу упаковывается в
+`outputs/zips/`. В папке лежат `metrics.csv`, `predictions.csv`,
+`classification_report.csv/png`, `config_used.yaml`,
+`train_val_test_years.json` и графики; сводка по всем запускам — в
+`outputs/summary.csv`.
 
-```bash
---models catboost        # selected model names, or --models all
---horizons 2             # one horizon
---horizons 2 3           # several horizons
---window-sizes 7         # one feature window
---window-sizes 5 7 9     # several feature windows
---top-n N                # keep only N best result folders per model, ranked by F1
---tune-trials N          # number of Optuna trials; use 0 for a fast smoke test
---output-dir PATH        # default: /kaggle/working/outputs
-```
+Файлы в `/kaggle/working` пропадают после остановки сессии. Чтобы их
+сохранить, добавьте `--upload-dataset --dataset-slug username/dataset-name`:
+архивы будут скопированы в `outputs/persistent_dataset/` и выложены командой
+`kaggle datasets version` (до трёх попыток).
 
-F1 is the primary ranking criterion. Result folders include the model name and
-feature-engineering variant plus F1 score as a percentage, for example
-`outputs/svm_temporal_fe_62/` for F1 ≈ 0.62. If a name already exists, a safe
-suffix is added.
+## Бенчмарк прогноза погоды: `train_weather.py`
 
-## 6. Outputs and zip files
-
-Each experiment writes a result folder with artifacts such as:
-
-- `metrics.csv`
-- `predictions.csv` with required `y_pred_binary`
-- `classification_report.csv`
-- `classification_report.png`
-- `config_used.yaml`
-- `train_val_test_years.json`
-- plot files when they are applicable
-- `skipped_plots.txt` when a plot is not applicable or plotting dependencies are unavailable
-
-After each experiment, the script immediately creates a zip archive in:
-
-```text
-/kaggle/working/outputs/zips/
-```
-
-Without `--upload-dataset`, zip files are only local. The script prints a warning
-because files in `/kaggle/working` can disappear after the Kaggle runtime stops.
-Missing Kaggle CLI credentials do not break a normal local-only run.
-
-## 7. Persist outputs in a Kaggle Dataset
-
-To additionally copy each zip to the persistent dataset staging directory and run
-Kaggle Dataset versioning:
+Прогнозирует только погодные переменные (`t_min`, `t_max`, `t_avg`,
+`precipitation`, `is_rain`, `cloudiness`) на 1 и 2 дня вперёд, без целевой
+переменной болезни и производных от неё признаков.
 
 ```bash
-python train.py \
-  --models svm \
-  --horizons 2 \
-  --window-sizes 7 \
-  --upload-dataset \
-  --dataset-slug username/dataset-name
+python train_weather.py --models catboost_hybrid lightgbm_hybrid --window-sizes 7 --tune-trials 0 --output-dir ./weather_outputs
+python train_weather.py --models catboost_hybrid lightgbm_hybrid chronos2 --window-sizes 7 11 --tune-trials 20
 ```
 
-With upload enabled, the script copies zips to:
+`catboost_hybrid` и `lightgbm_hybrid` обучают по модели на каждую переменную и
+смешивают её с бейзлайном persistence по валидации. `chronos2` — zero-shot
+Chronos-2 (`amazon/chronos-2`, скачивается с Hugging Face при первом запуске).
 
-```text
-/kaggle/working/outputs/persistent_dataset/
-```
+Метрики: MAE, RMSE, sMAPE и R² для непрерывных переменных; accuracy, F1,
+precision, recall, ROC AUC и Brier для `is_rain`. Сводка —
+`summary_weather.csv`, детализация — `metrics_weather_all.csv`.
 
-It also creates or updates `dataset-metadata.json` using the slug from
-`--dataset-slug`, then runs:
+## Тесты
 
 ```bash
-kaggle datasets version -p /kaggle/working/outputs/persistent_dataset/ -m "new experiment results"
+python -m pytest -q
 ```
-
-Upload is retried 3 times. After 3 failed attempts, the error is not hidden.
-
-## 8. Smoke test used during development
-
-```bash
-python train.py --models svm --horizons 2 --window-sizes 7 --top-n 1 --tune-trials 0 --output-dir /tmp/diploma-smoke
-```
-
-Expected evidence: an experiment folder plus a zip in `/tmp/diploma-smoke/zips/`.
